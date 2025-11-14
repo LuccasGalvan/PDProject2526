@@ -16,7 +16,7 @@ public class ClientConnection {
         this.dirAddr = dirAddr;
         this.dirUdpPort = dirUdpPort;
     }
-    //teste
+    //testea
     public boolean connectToPrimary() {
         ServerEndpoint ep = requestPrimaryFromDirectory();
         if (ep == null) {
