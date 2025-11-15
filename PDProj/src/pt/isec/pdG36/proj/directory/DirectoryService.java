@@ -1,41 +1,22 @@
 package pt.isec.pdG36.proj.directory;
 
+import pt.isec.pdG36.proj.directory.core.ServerRegistry;
+import pt.isec.pdG36.proj.directory.model.ServerInfo;
+import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
+
 import java.io.IOException;
 import java.net.*;
-import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class DirectoryService {
-
     private static final long HEARTBEAT_TIMEOUT_MS = 17_000;
 
     private final int udpPort;
     private DatagramSocket socket;
+    private final ServerRegistry registry;
 
-    // Server identity: IP + ports
-    private static class ServerInfo {
-        final InetAddress address;
-        final int clientTcpPort;
-        final int dbTcpPort;
-        volatile long lastHeartbeat; // timestamp in ms
-
-        ServerInfo(InetAddress address, int clientTcpPort, int dbTcpPort) {
-            this.address = address;
-            this.clientTcpPort = clientTcpPort;
-            this.dbTcpPort = dbTcpPort;
-            this.lastHeartbeat = System.currentTimeMillis();
-        }
-    }
-
-    // For quick lookup
-    private final Map<String, ServerInfo> serversByKey = new ConcurrentHashMap<>();
-
-    // For FIFO order of registration
-    private final LinkedList<ServerInfo> orderedServers = new LinkedList<>();
-
-    public DirectoryService(int udpPort) {
+    public DirectoryService(int udpPort, ServerRegistry registry) {
         this.udpPort = udpPort;
+        this.registry = registry;
     }
 
     public void start() throws IOException {
@@ -59,89 +40,71 @@ public class DirectoryService {
 
     private void handlePacket(DatagramPacket packet) throws IOException {
         String msg = new String(packet.getData(), 0, packet.getLength()).trim();
+        if (msg.isEmpty()) return;
+
         String[] parts = msg.split("\\s+");
-        if (parts.length == 0) return;
+        String cmd = parts[0];
 
         InetAddress srcAddr = packet.getAddress();
         int srcPort = packet.getPort();
 
-        switch (parts[0]) {
-            case "REGISTER" -> handleRegister(parts, srcAddr, srcPort);
-            case "HEARTBEAT" -> handleHeartbeat(parts, srcAddr);
-            case "UNREGISTER" -> handleUnregister(parts, srcAddr);
-            case "GET_SERVER" -> handleGetServer(srcAddr, srcPort);
+        switch (cmd) {
+            case "REGISTER" -> onRegister(parts, srcAddr, srcPort);
+            case "HEARTBEAT" -> onHeartbeat(parts, srcAddr);
+            case "UNREGISTER" -> onUnregister(parts, srcAddr);
+            case "GET_SERVER" -> onGetServer(srcAddr, srcPort);
             default -> {
-                // ignore unknown
+                // ignore invalid
             }
         }
     }
 
-    private void handleRegister(String[] parts, InetAddress addr, int replyPort) throws IOException {
+    private void onRegister(String[] parts, InetAddress addr, int replyPort) throws IOException {
         if (parts.length < 3) return;
         int clientPort = Integer.parseInt(parts[1]);
         int dbPort = Integer.parseInt(parts[2]);
 
-        String key = key(addr, clientPort, dbPort);
+        ServerInfo info = registry.register(addr, clientPort, dbPort);
+        System.out.printf("Registered server %s:%d (db:%d)%n",
+                info.getAddress().getHostAddress(),
+                info.getClientTcpPort(),
+                info.getDbTcpPort());
 
-        synchronized (orderedServers) {
-            if (!serversByKey.containsKey(key)) {
-                ServerInfo info = new ServerInfo(addr, clientPort, dbPort);
-                serversByKey.put(key, info);
-                orderedServers.addLast(info);
-                System.out.printf("Registered server %s:%d (db:%d) at %s%n",
-                        addr.getHostAddress(), clientPort, dbPort, Instant.now());
-            }
-        }
-
-        // Determine primary (oldest)
-        ServerInfo primary = getPrimary();
-        // Reply: PRIMARY <ip> <dbPort>
+        ServerInfo primary = registry.getPrimary();
         if (primary != null) {
-            String resp = "PRIMARY " + primary.address.getHostAddress() + " " + primary.dbTcpPort;
-            byte[] data = resp.getBytes();
-            DatagramPacket reply = new DatagramPacket(data, data.length, addr, replyPort);
-            socket.send(reply);
+            String resp = DirectoryProtocol.buildPrimaryReply(
+                    primary.getAddress().getHostAddress(),
+                    primary.getDbTcpPort()
+            );
+            sendUdp(resp, addr, replyPort);
         }
     }
 
-    private void handleHeartbeat(String[] parts, InetAddress addr) {
+    private void onHeartbeat(String[] parts, InetAddress addr) {
         if (parts.length < 4) return;
         int clientPort = Integer.parseInt(parts[1]);
         int dbPort = Integer.parseInt(parts[2]);
-        // parts[3] could be dbVersion; ignore for skeleton
+        // parts[3] = dbVersion (ignored here)
 
-        String key = key(addr, clientPort, dbPort);
-        ServerInfo info = serversByKey.get(key);
-        if (info != null) {
-            info.lastHeartbeat = System.currentTimeMillis();
-        }
-        // If not registered: ignore
+        registry.heartbeat(addr, clientPort, dbPort, System.currentTimeMillis());
     }
 
-    private void handleUnregister(String[] parts, InetAddress addr) {
+    private void onUnregister(String[] parts, InetAddress addr) {
         if (parts.length < 3) return;
         int clientPort = Integer.parseInt(parts[1]);
         int dbPort = Integer.parseInt(parts[2]);
-        removeServer(key(addr, clientPort, dbPort));
+        registry.unregister(addr, clientPort, dbPort);
     }
 
-    private void handleGetServer(InetAddress addr, int replyPort) throws IOException {
-        ServerInfo primary = getPrimary();
-        String resp;
-        if (primary == null) {
-            resp = "NO_SERVER";
-        } else {
-            resp = "SERVER " + primary.address.getHostAddress() + " " + primary.clientTcpPort;
-        }
-        byte[] data = resp.getBytes();
-        DatagramPacket reply = new DatagramPacket(data, data.length, addr, replyPort);
-        socket.send(reply);
-    }
-
-    private ServerInfo getPrimary() {
-        synchronized (orderedServers) {
-            return orderedServers.peekFirst();
-        }
+    private void onGetServer(InetAddress addr, int replyPort) throws IOException {
+        ServerInfo primary = registry.getPrimary();
+        String resp = (primary == null)
+                ? DirectoryProtocol.buildNoServerReply()
+                : DirectoryProtocol.buildServerReply(
+                primary.getAddress().getHostAddress(),
+                primary.getClientTcpPort()
+        );
+        sendUdp(resp, addr, replyPort);
     }
 
     private void cleanupLoop() {
@@ -149,37 +112,16 @@ public class DirectoryService {
             try {
                 Thread.sleep(1000);
                 long now = System.currentTimeMillis();
-                synchronized (orderedServers) {
-                    Iterator<ServerInfo> it = orderedServers.iterator();
-                    while (it.hasNext()) {
-                        ServerInfo s = it.next();
-                        if (now - s.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
-                            String key = key(s.address, s.clientTcpPort, s.dbTcpPort);
-                            serversByKey.remove(key);
-                            it.remove();
-                            System.out.printf("Removed server %s:%d (timeout)%n",
-                                    s.address.getHostAddress(), s.clientTcpPort);
-                        }
-                    }
-                }
+                registry.cleanupExpired(now, HEARTBEAT_TIMEOUT_MS);
             } catch (InterruptedException ignored) {
             }
         }
     }
 
-    private void removeServer(String key) {
-        synchronized (orderedServers) {
-            ServerInfo info = serversByKey.remove(key);
-            if (info != null) {
-                orderedServers.remove(info);
-                System.out.printf("Unregistered server %s:%d%n",
-                        info.address.getHostAddress(), info.clientTcpPort);
-            }
-        }
-    }
-
-    private String key(InetAddress addr, int clientPort, int dbPort) {
-        return addr.getHostAddress() + ":" + clientPort + ":" + dbPort;
+    private void sendUdp(String msg, InetAddress addr, int port) throws IOException {
+        byte[] data = msg.getBytes();
+        DatagramPacket p = new DatagramPacket(data, data.length, addr, port);
+        socket.send(p);
     }
 
     public static void main(String[] args) throws Exception {
@@ -188,6 +130,7 @@ public class DirectoryService {
             return;
         }
         int udpPort = Integer.parseInt(args[0]);
-        new DirectoryService(udpPort).start();
+        ServerRegistry registry = new ServerRegistry();
+        new DirectoryService(udpPort, registry).start();
     }
 }
