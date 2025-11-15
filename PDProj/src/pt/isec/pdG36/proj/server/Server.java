@@ -1,4 +1,8 @@
+// language: java
 package pt.isec.pdG36.proj.server;
+
+import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
+import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
 
 import java.io.*;
 import java.net.*;
@@ -16,6 +20,8 @@ public class Server {
     private InetAddress primaryDbAddr;
     private int primaryDbPort;
     private boolean isPrimary;
+
+    private volatile long dbVersion = 0;
 
     public Server(InetAddress dirAddr, int dirUdpPort, File dbDirectory, InetAddress multicastIface) {
         this.dirAddr = dirAddr;
@@ -60,33 +66,45 @@ public class Server {
     private boolean registerWithDirectory(int clientPort, int dbPort) {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setSoTimeout(3000);
-            String msg = "REGISTER " + clientPort + " " + dbPort;
-            byte[] data = msg.getBytes();
+
+            String regMsg = DirectoryProtocol.buildRegister(clientPort, dbPort);
+            byte[] data = regMsg.getBytes();
 
             DatagramPacket packet = new DatagramPacket(data, data.length, dirAddr, dirUdpPort);
             socket.send(packet);
 
+            //waiting for primary response
             byte[] buf = new byte[256];
+
             DatagramPacket resp = new DatagramPacket(buf, buf.length);
             socket.receive(resp);
 
             String reply = new String(resp.getData(), 0, resp.getLength()).trim();
+            DirectoryProtocol.PrimaryInfo primaryInfo = DirectoryProtocol.parsePrimary(reply);
             // Expected: PRIMARY <ip> <dbPort>
-            String[] parts = reply.split("\\s+");
-            if (parts.length == 3 && "PRIMARY".equals(parts[0])) {
-                primaryDbAddr = InetAddress.getByName(parts[1]);
-                primaryDbPort = Integer.parseInt(parts[2]);
-
-                // If primary info matches us -> we are primary
-                isPrimary = primaryDbAddr.equals(InetAddress.getLocalHost())
-                        && primaryDbPort == dbPort;
-                System.out.println("Primary is " + primaryDbAddr.getHostAddress() + ":" + primaryDbPort
-                        + " | isPrimary=" + isPrimary);
-                return true;
-            } else {
-                System.err.println("Unexpected directory reply: " + reply);
+            if (primaryInfo == null) {
+                System.err.println("[SERVER] Unexpected directory reply: " + reply);
                 return false;
             }
+
+            primaryDbAddr = InetAddress.getByName(primaryInfo.ip());
+            primaryDbPort = primaryInfo.dbPort();
+
+            // check if we are primary:
+            // NOTE: local address matching is tricky in real env; skeleton style:
+            boolean samePort = (primaryDbPort == dbPort);
+            boolean sameHost = primaryDbAddr.equals(InetAddress.getLocalHost())
+                    || primaryDbAddr.isAnyLocalAddress()
+                    || primaryDbAddr.getHostAddress().equals(InetAddress.getLocalHost().getHostAddress());
+
+            isPrimary = samePort && sameHost;
+
+            System.out.println("[SERVER] PRIMARY is " +
+                    primaryDbAddr.getHostAddress() + ":" + primaryDbPort +
+                    " | isPrimary=" + isPrimary);
+
+            return true;
+
         } catch (IOException e) {
             System.err.println("Error registering with directory: " + e.getMessage());
             return false;
@@ -94,17 +112,41 @@ public class Server {
     }
 
     private void initOrLoadLocalDbAsPrimary() {
-        // TODO:
-        // - scan dbDirectory for .db files
-        // - choose/create latest as version 0+...
-        System.out.println("Initializing/choosing local DB as primary (TODO).");
+        // For now: just ensure a dummy DB file exists so the server can run.
+        try {
+            if (!dbDirectory.exists() && !dbDirectory.mkdirs()) {
+                System.err.println("[SERVER] Could not create db directory: " + dbDirectory.getAbsolutePath());
+                return;
+            }
+
+            File dbFile = new File(dbDirectory, "dummy.db");
+
+            if (!dbFile.exists()) {
+                boolean created = dbFile.createNewFile();
+                if (created) {
+                    System.out.println("[SERVER] Created dummy DB file at: " + dbFile.getAbsolutePath());
+                } else {
+                    System.out.println("[SERVER] Dummy DB file already exists: " + dbFile.getAbsolutePath());
+                }
+            } else {
+                System.out.println("[SERVER] Using existing dummy DB file at: " + dbFile.getAbsolutePath());
+            }
+
+            // start with version 0
+            dbVersion = 0;
+
+        } catch (IOException e) {
+            System.err.println("[SERVER] Error creating dummy DB: " + e.getMessage());
+        }
     }
 
     private void obtainDbFromPrimary() {
-        // TODO:
-        // - connect via TCP to primaryDbAddr:primaryDbPort
-        // - receive .db file and store in dbDirectory
-        System.out.println("Obtaining DB from primary " + primaryDbAddr + ":" + primaryDbPort + " (TODO).");
+        // For now, we just behave like "ok, we got the DB"
+        System.out.println("[SERVER] (DUMMY) Would fetch DB from primary " +
+                primaryDbAddr.getHostAddress() + ":" + primaryDbPort);
+
+        // Reuse the same dummy as primary so code paths are similar
+        initOrLoadLocalDbAsPrimary();
     }
 
     private void startClientAcceptor() {
@@ -113,9 +155,7 @@ public class Server {
             while (true) {
                 try {
                     Socket client = clientServerSocket.accept();
-                    // TODO: spawn handler thread (auth, commands, etc.)
-                    System.out.println("Client connected from " + client.getRemoteSocketAddress());
-                    client.close(); // placeholder
+                    new ClientHandler(client).start();
                 } catch (IOException e) {
                     System.err.println("Client accept error: " + e.getMessage());
                     break;
@@ -148,9 +188,8 @@ public class Server {
                 InetAddress mcastAddr = InetAddress.getByName("230.30.30.30");
                 int mcastPort = 3030;
                 while (true) {
-                    // minimal heartbeat (no SQL yet)
-                    String msg = "HEARTBEAT " + clientPort + " " + dbPort + " " + /*dbVersion*/ 0;
-                    byte[] data = msg.getBytes();
+                    String hb = DirectoryProtocol.buildHeartbeat(clientPort, dbPort, dbVersion);
+                    byte[] data = hb.getBytes();
 
                     // to directory
                     udp.send(new DatagramPacket(data, data.length, dirAddr, dirUdpPort));
@@ -168,12 +207,12 @@ public class Server {
     }
 
     private void startHeartbeatMulticastListener() {
-        // Skeleton: join group and read; later you implement logic from spec.
         Thread t = new Thread(() -> {
             try (MulticastSocket mcast = new MulticastSocket(3030)) {
                 InetAddress group = InetAddress.getByName("230.30.30.30");
-                mcast.joinGroup(new InetSocketAddress(group, 3030),
-                        NetworkInterface.getByInetAddress(multicastIface));
+                NetworkInterface ni = NetworkInterface.getByInetAddress(multicastIface);
+
+                mcast.joinGroup(new InetSocketAddress(group, 3030), ni);
 
                 byte[] buf = new byte[512];
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
@@ -181,19 +220,75 @@ public class Server {
                 while (true) {
                     mcast.receive(packet);
                     String msg = new String(packet.getData(), 0, packet.getLength()).trim();
-                    // TODO: ignore our own & non-primary; process version/SQL as per spec
+                    // Later:
+                    // - ignore our own
+                    // - if from PRIMARY & newer dbVersion, sync changes
                 }
             } catch (IOException e) {
-                System.err.println("Multicast listener stopped: " + e.getMessage());
+                System.err.println("[SERVER] Multicast listener stopped: " + e.getMessage());
             }
-        }, "HeartbeatMulticastListener");
+        }, "HeartbeatMcastListener");
         t.setDaemon(true);
         t.start();
     }
 
+    // Inner class for handling a client connection
+    private class ClientHandler extends Thread {
+        private final Socket socket;
+
+        ClientHandler(Socket socket) {
+            this.socket = socket;
+            setName("ClientHandler-" + socket.getRemoteSocketAddress());
+        }
+
+        @Override
+        public void run() {
+            try (Socket s = this.socket;
+                 BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                 PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+
+                // Read login request
+                String first = in.readLine();
+                ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(first);
+                if (req == null) {
+                    out.println(ClientServerProtocol.buildError("INVALID_LOGIN_REQUEST"));
+                    return;
+                }
+
+                String username = req.username();
+                String password = req.password();
+
+                // Dummy auth
+                String role = null;
+                if ("admin".equals(username) && "admin".equals(password)) {
+                    role = "TEACHER";
+                } else if ("student".equals(username) && "student".equals(password)) {
+                    role = "STUDENT";
+                }
+
+                if (role == null) {
+                    out.println(ClientServerProtocol.buildLoginFail("Invalid credentials"));
+                    return;
+                }
+
+                out.println(ClientServerProtocol.buildLoginOk(role, "Welcome " + username));
+
+                // Post-login: simple echo loop
+                String line;
+                while ((line = in.readLine()) != null) {
+                    // For now echo input back
+                    out.println("ECHO " + line);
+                }
+
+            } catch (IOException e) {
+                System.err.println("Client handler error: " + e.getMessage());
+            }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length != 4) {
-            System.out.println("Usage: java PDServer <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIP>");
+            System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIP>");
             return;
         }
         InetAddress dirAddr = InetAddress.getByName(args[0]);
@@ -209,4 +304,3 @@ public class Server {
         new Server(dirAddr, dirPort, dbDir, mcIf).start();
     }
 }
-
