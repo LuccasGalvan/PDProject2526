@@ -8,6 +8,10 @@ public final class ClientServerProtocol {
     private static final String LOGIN_OK = "LOGIN_OK";
     private static final String LOGIN_FAIL = "LOGIN_FAIL";
     private static final String ERROR = "ERROR";
+    private static final String REGISTER_STUDENT = "REGISTER_STUDENT";
+    private static final String REGISTER_TEACHER = "REGISTER_TEACHER";
+    private static final String REGISTER_OK = "REGISTER_OK";
+    private static final String REGISTER_FAIL = "REGISTER_FAIL";
 
     // Builders
     public static String buildLoginRequest(String username, String password) {
@@ -26,6 +30,21 @@ public final class ClientServerProtocol {
         return ERROR + " " + (message == null ? "" : message);
     }
 
+    public static String buildRegisterStudent(int number, String name, String email, String password) {
+        return REGISTER_STUDENT + " " + number + " " + name + " " + email + " " + password;
+    }
+
+    public static String buildRegisterTeacher(String name, String email, String password, String teacherCode) {
+        return REGISTER_TEACHER + " " + name + " " + email + " " + password + " " + teacherCode;
+    }
+
+    public static String buildRegisterOk(String message) {
+        return REGISTER_OK + " " + (message == null ? "" : message);
+    }
+
+    public static String buildRegisterFail(String message) {
+        return REGISTER_FAIL + " " + (message == null ? "" : message);
+    }
     // Records
     public record LoginResponse(boolean success, String role, String message) {}
     public record LoginRequest(String username, String password) {}

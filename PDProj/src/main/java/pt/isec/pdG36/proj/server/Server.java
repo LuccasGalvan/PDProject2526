@@ -1,9 +1,12 @@
 // language: java
 package pt.isec.pdG36.proj.server;
 
+
 import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
 import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
+import pt.isec.pdG36.proj.server.db.DatabaseManager;
 
+import javax.xml.crypto.Data;
 import java.io.*;
 import java.net.*;
 
@@ -22,6 +25,8 @@ public class Server {
     private boolean isPrimary;
 
     private volatile long dbVersion = 0;
+
+    private DatabaseManager dbManager;
 
     public Server(InetAddress dirAddr, int dirUdpPort, File dbDirectory, InetAddress multicastIface) {
         this.dirAddr = dirAddr;
@@ -112,31 +117,23 @@ public class Server {
     }
 
     private void initOrLoadLocalDbAsPrimary() {
-        // For now: just ensure a dummy DB file exists so the server can run.
         try {
             if (!dbDirectory.exists() && !dbDirectory.mkdirs()) {
                 System.err.println("[SERVER] Could not create db directory: " + dbDirectory.getAbsolutePath());
                 return;
             }
 
-            File dbFile = new File(dbDirectory, "dummy.db");
+            File dbFile = new File(dbDirectory, "quiz.db");
+            dbManager = new DatabaseManager(dbFile.toPath());
+            dbManager.connect();
+            dbManager.initSchema();
 
-            if (!dbFile.exists()) {
-                boolean created = dbFile.createNewFile();
-                if (created) {
-                    System.out.println("[SERVER] Created dummy DB file at: " + dbFile.getAbsolutePath());
-                } else {
-                    System.out.println("[SERVER] Dummy DB file already exists: " + dbFile.getAbsolutePath());
-                }
-            } else {
-                System.out.println("[SERVER] Using existing dummy DB file at: " + dbFile.getAbsolutePath());
-            }
-
-            // start with version 0
             dbVersion = 0;
+            System.out.println("[SERVER] SQLite DB ready at " + dbFile.getAbsolutePath());
 
-        } catch (IOException e) {
-            System.err.println("[SERVER] Error creating dummy DB: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("[SERVER] Error initializing DB: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -280,6 +277,8 @@ public class Server {
                     out.println("ECHO " + line);
                 }
 
+
+
             } catch (IOException e) {
                 System.err.println("Client handler error: " + e.getMessage());
             }
@@ -294,6 +293,7 @@ public class Server {
         InetAddress dirAddr = InetAddress.getByName(args[0]);
         int dirPort = Integer.parseInt(args[1]);
         File dbDir = new File(args[2]);
+        // File dbDir = new File(dbDirectory, "quiz_system.db");
         InetAddress mcIf = InetAddress.getByName(args[3]);
 
         if (!dbDir.exists() && !dbDir.mkdirs()) {
