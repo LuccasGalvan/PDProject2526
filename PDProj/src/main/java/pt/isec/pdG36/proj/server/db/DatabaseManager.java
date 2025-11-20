@@ -12,35 +12,79 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     public void connect() throws SQLException {
-        if (conn != null && !conn.isClosed())
-            return;
+        try {
+            Class.forName("org.sqlite.JDBC");
+        } catch (ClassNotFoundException e) {
+            throw new SQLException("SQLite JDBC driver not found on classpath", e);
+        }
 
         String url = "jdbc:sqlite:" + dbPath.toAbsolutePath();
-        conn = DriverManager.getConnection(url);
-        conn.setAutoCommit(true); // ok for now
+        this.conn = DriverManager.getConnection(url);
     }
 
+    // This will only create the tables for the database
     public void initSchema() throws SQLException {
-        try (Statement st = conn.createStatement()) {
-            // Example user table (teacher + student in one)
-            st.executeUpdate("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    role TEXT NOT NULL,             -- 'TEACHER' or 'STUDENT'
-                    student_number INTEGER,         -- only for students
-                    name TEXT NOT NULL,
-                    email TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL
-                )
-            """);
+        try (Statement stmt = conn.createStatement()) {
 
-            // Optional config table with teacher registration code hash
-            st.executeUpdate("""
-                CREATE TABLE IF NOT EXISTS config (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """);
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );
+        """);
+
+            stmt.executeUpdate("""
+            INSERT OR IGNORE INTO version (id, version)
+            VALUES (1, 0);
+        """);
+
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('teacher', 'student')),
+                number INTEGER,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                passwordHash TEXT NOT NULL
+            );
+        """);
+
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacherId INTEGER NOT NULL,
+                statement TEXT NOT NULL,
+                startTime TEXT NOT NULL,
+                endTime TEXT NOT NULL,
+                accessCode TEXT NOT NULL UNIQUE,
+                FOREIGN KEY (teacherId) REFERENCES users(id)
+            );
+        """);
+
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                questionId INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                text TEXT NOT NULL,
+                isCorrect INTEGER NOT NULL CHECK (isCorrect IN (0,1)),
+                FOREIGN KEY (questionId) REFERENCES questions(id)
+            );
+        """);
+
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                studentId INTEGER NOT NULL,
+                questionId INTEGER NOT NULL,
+                optionCode TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (studentId) REFERENCES users(id),
+                FOREIGN KEY (questionId) REFERENCES questions(id)
+            );
+        """);
+
+            System.out.println("[DB] Schema initialized.");
         }
     }
 

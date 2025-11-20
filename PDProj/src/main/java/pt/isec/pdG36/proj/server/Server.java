@@ -98,9 +98,7 @@ public class Server {
             // check if we are primary:
             // NOTE: local address matching is tricky in real env; skeleton style:
             boolean samePort = (primaryDbPort == dbPort);
-            boolean sameHost = primaryDbAddr.equals(InetAddress.getLocalHost())
-                    || primaryDbAddr.isAnyLocalAddress()
-                    || primaryDbAddr.getHostAddress().equals(InetAddress.getLocalHost().getHostAddress());
+            boolean sameHost = true;
 
             isPrimary = samePort && sameHost;
 
@@ -128,7 +126,7 @@ public class Server {
             dbManager.connect();
             dbManager.initSchema();
 
-            dbVersion = 0;
+            //dbVersion = 0;
             System.out.println("[SERVER] SQLite DB ready at " + dbFile.getAbsolutePath());
 
         } catch (Exception e) {
@@ -229,6 +227,80 @@ public class Server {
         t.start();
     }
 
+    private void handleLogin(String[] parts, PrintWriter out) {
+        // reuse your existing parseLoginRequest if you want:
+        // ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(String.join(" ", parts));
+
+        if (parts.length < 3) {
+            out.println(ClientServerProtocol.buildLoginFail("Missing credentials"));
+            return;
+        }
+
+        String email = parts[1];
+        String password = parts[2];
+
+        try {
+            var user = dbManager.authenticate(email, password);
+            if (user == null) {
+                out.println(ClientServerProtocol.buildLoginFail("Invalid credentials"));
+                return;
+            }
+
+            out.println(ClientServerProtocol.buildLoginOk(user.role(), "Welcome " + user.name()));
+            // TODO: POST LOGIN COMMMANDS AND LOOP
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            out.println(ClientServerProtocol.buildError("LOGIN_ERROR"));
+        }
+    }
+
+    private void handleRegisterStudent(String[] parts, PrintWriter out) {
+        // Example: REGISTER_STUDENT <number> <name> <email> <password>
+        if (parts.length < 5) {
+            out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
+            return;
+        }
+
+        int number = Integer.parseInt(parts[1]);
+        String name = parts[2];
+        String email = parts[3];
+        String password = parts[4];
+
+        try {
+            boolean ok = dbManager.registerStudent(number, name, email, password);
+            if (ok)
+                out.println(ClientServerProtocol.buildRegisterOk("Student registered"));
+            else
+                out.println(ClientServerProtocol.buildRegisterFail("Duplicate email or number"));
+        } catch (Exception e) {
+            out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+        }
+    }
+
+    private void handleRegisterTeacher(String[] parts, PrintWriter out) {
+        // Example: REGISTER_TEACHER <number> <name> <email> <password>
+        if (parts.length < 5) {
+            out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
+            return;
+        }
+
+        String name = parts[1];
+        String email = parts[2];
+        String password = parts[3];
+        String teacherCodeHash = parts[4];
+
+        try {
+            boolean ok = dbManager.registerTeacher(name, email, password, teacherCodeHash);
+            if (ok)
+                out.println(ClientServerProtocol.buildRegisterOk("Teacher registered"));
+            else
+                out.println(ClientServerProtocol.buildRegisterFail("Duplicate email or number"));
+        } catch (Exception e) {
+            out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+        }
+    }
+
     // Inner class for handling a client connection
     private class ClientHandler extends Thread {
         private final Socket socket;
@@ -252,23 +324,15 @@ public class Server {
                     return;
                 }
 
-                String username = req.username();
-                String password = req.password();
+                String[] parts = first.trim().split("\\s+");
+                String cmd = parts[0];
 
-                // Dummy auth
-                String role = null;
-                if ("admin".equals(username) && "admin".equals(password)) {
-                    role = "TEACHER";
-                } else if ("student".equals(username) && "student".equals(password)) {
-                    role = "STUDENT";
+                switch (cmd) {
+                    case "LOGIN" -> handleLogin(parts, out);
+                    case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
+                    case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
+                    default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
                 }
-
-                if (role == null) {
-                    out.println(ClientServerProtocol.buildLoginFail("Invalid credentials"));
-                    return;
-                }
-
-                out.println(ClientServerProtocol.buildLoginOk(role, "Welcome " + username));
 
                 // Post-login: simple echo loop
                 String line;
@@ -287,13 +351,13 @@ public class Server {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 4) {
-            System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIP>");
+            System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");
             return;
         }
+
         InetAddress dirAddr = InetAddress.getByName(args[0]);
         int dirPort = Integer.parseInt(args[1]);
         File dbDir = new File(args[2]);
-        // File dbDir = new File(dbDirectory, "quiz_system.db");
         InetAddress mcIf = InetAddress.getByName(args[3]);
 
         if (!dbDir.exists() && !dbDir.mkdirs()) {

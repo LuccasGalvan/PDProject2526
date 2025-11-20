@@ -3,7 +3,10 @@ C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\pro
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\client\ClientConnection.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\common\protocol\ClientServerProtocol.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\common\protocol\DirectoryProtocol.java
+C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\server\db\PassUtil.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\directory\core\ServerRegistry.java
+C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\server\db\DatabaseManager.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\client\ClientMain.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\directory\DirectoryService.java
 C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\server\Server.java
+C:\Users\Mario\IdeaProjects\PDProject2526\PDProj\src\main\java\pt\isec\pdG36\proj\server\db\User.java
