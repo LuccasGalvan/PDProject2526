@@ -5,6 +5,7 @@ package pt.isec.pdG36.proj.server;
 import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
 import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
 import pt.isec.pdG36.proj.server.db.DatabaseManager;
+import pt.isec.pdG36.proj.server.db.User;
 
 import javax.xml.crypto.Data;
 import java.io.*;
@@ -125,8 +126,7 @@ public class Server {
             dbManager = new DatabaseManager(dbFile.toPath());
             dbManager.connect();
             dbManager.initSchema();
-
-            //dbVersion = 0;
+            dbVersion = 0;
             System.out.println("[SERVER] SQLite DB ready at " + dbFile.getAbsolutePath());
 
         } catch (Exception e) {
@@ -227,10 +227,7 @@ public class Server {
         t.start();
     }
 
-    private void handleLogin(String[] parts, PrintWriter out) {
-        // reuse your existing parseLoginRequest if you want:
-        // ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(String.join(" ", parts));
-
+    private void handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
         if (parts.length < 3) {
             out.println(ClientServerProtocol.buildLoginFail("Missing credentials"));
             return;
@@ -246,8 +243,12 @@ public class Server {
                 return;
             }
 
-            out.println(ClientServerProtocol.buildLoginOk(user.role(), "Welcome " + user.name()));
-            // TODO: POST LOGIN COMMMANDS AND LOOP
+            out.println(ClientServerProtocol.buildLoginOk(
+                    user.role(),
+                    "Welcome " + user.name()));
+
+            //TODO: after login, open a post-login command loop
+            postLoginLoop(user, in, out);
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -301,6 +302,35 @@ public class Server {
         }
     }
 
+    private void postLoginLoop(User user, BufferedReader in, PrintWriter out) throws IOException {
+        String line;
+        while ((line = in.readLine()) != null) {
+
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length == 0)
+                continue;
+
+            String cmd = parts[0].toUpperCase();
+
+            switch (cmd) {
+
+                case "PING" -> out.println("PONG");
+
+                case "LOGOUT" -> {
+                    out.println("BYE");
+                    return; // exit the loop and close connection
+                }
+
+                // future commands
+                case "CREATE_QUESTION" -> {
+                    // TODO step 5
+                }
+
+                default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
+            }
+        }
+    }
+
     // Inner class for handling a client connection
     private class ClientHandler extends Thread {
         private final Socket socket;
@@ -318,28 +348,31 @@ public class Server {
 
                 // Read login request
                 String first = in.readLine();
-                ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(first);
-                if (req == null) {
-                    out.println(ClientServerProtocol.buildError("INVALID_LOGIN_REQUEST"));
+                //ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(first);
+                if (first == null) {
+                    out.println(ClientServerProtocol.buildError("EMPTY_REQUEST"));
                     return;
                 }
 
                 String[] parts = first.trim().split("\\s+");
-                String cmd = parts[0];
+                String cmd = parts[0].toUpperCase();
 
                 switch (cmd) {
-                    case "LOGIN" -> handleLogin(parts, out);
+                    case "LOGIN" -> handleLogin(parts, in, out);
                     case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
                     case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
-                    default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
+                    default -> {
+                        out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
+                        return;
+                    }
                 }
 
-                // Post-login: simple echo loop
+                /* Post-login: simple echo loop
                 String line;
                 while ((line = in.readLine()) != null) {
                     // For now echo input back
                     out.println("ECHO " + line);
-                }
+                } */
 
 
 

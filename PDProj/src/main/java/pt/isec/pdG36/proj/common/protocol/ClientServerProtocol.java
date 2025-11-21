@@ -30,12 +30,12 @@ public final class ClientServerProtocol {
         return ERROR + " " + (message == null ? "" : message);
     }
 
-    public static String buildRegisterStudent(int number, String name, String email, String password) {
+    public static String buildRegisterStudentRequest(int number, String name, String email, String password) {
         return REGISTER_STUDENT + " " + number + " " + name + " " + email + " " + password;
     }
 
-    public static String buildRegisterTeacher(String name, String email, String password, String teacherCode) {
-        return REGISTER_TEACHER + " " + name + " " + email + " " + password + " " + teacherCode;
+    public static String buildRegisterTeacherRequest(String name, String email, String password, String teacherCodeHash) {
+        return REGISTER_TEACHER + " " + name + " " + email + " " + password + " " + teacherCodeHash;
     }
 
     public static String buildRegisterOk(String message) {
@@ -48,7 +48,7 @@ public final class ClientServerProtocol {
     // Records
     public record LoginResponse(boolean success, String role, String message) {}
     public record LoginRequest(String username, String password) {}
-
+    public record RegisterResponse(boolean success, String message) {}
     // Parsers
     public static LoginResponse parseLoginResponse(String line) {
         if (line == null) return null;
@@ -67,6 +67,25 @@ public final class ClientServerProtocol {
             String msg = parts.length >= 2 ? parts[1] : "";
             if (parts.length > 2) msg = parts[1] + " " + parts[2];
             return new LoginResponse(false, null, "ERROR: " + msg);
+        }
+        return null;
+    }
+
+    public static RegisterResponse parseRegisterResponse(String line) {
+        if (line == null) return null;
+        String trimmed = line.trim();
+        if (trimmed.isEmpty()) return null;
+
+        String[] parts = trimmed.split("\\s+", 2);
+        String cmd = parts[0];
+        String msg = parts.length >= 2 ? parts[1] : "";
+
+        if (REGISTER_OK.equals(cmd)) {
+            return new RegisterResponse(true, msg);
+        } else if (REGISTER_FAIL.equals(cmd)) {
+            return new RegisterResponse(false, msg);
+        } else if (ERROR.equals(cmd)) {
+            return new RegisterResponse(false, "ERROR: " + msg);
         }
         return null;
     }
