@@ -40,12 +40,12 @@ public class DatabaseManager implements AutoCloseable {
 
             stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL CHECK (type IN ('teacher', 'student')),
-                number INTEGER,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                passwordHash TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL CHECK (role IN ('TEACHER','STUDENT')),
+            student_number INTEGER,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL
             );
         """);
 

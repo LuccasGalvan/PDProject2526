@@ -12,6 +12,7 @@ pt\isec\pdG36\proj\directory\core\ServerRegistry.class
 pt\isec\pdG36\proj\server\db\DatabaseManager.class
 pt\isec\pdG36\proj\server\db\User.class
 pt\isec\pdG36\proj\common\protocol\DirectoryProtocol$PrimaryInfo.class
+pt\isec\pdG36\proj\common\protocol\ClientServerProtocol$RegisterResponse.class
 pt\isec\pdG36\proj\directory\model\ServerInfo.class
 pt\isec\pdG36\proj\common\protocol\DirectoryProtocol.class
 pt\isec\pdG36\proj\client\ClientConnection$ServerEndpoint.class

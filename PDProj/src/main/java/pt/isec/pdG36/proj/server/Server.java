@@ -227,32 +227,35 @@ public class Server {
         t.start();
     }
 
-    private void handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
+    private User handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
         if (parts.length < 3) {
             out.println(ClientServerProtocol.buildLoginFail("Missing credentials"));
-            return;
+            return null;
         }
 
         String email = parts[1];
         String password = parts[2];
 
         try {
-            var user = dbManager.authenticate(email, password);
+            User user = dbManager.authenticate(email, password);
             if (user == null) {
                 out.println(ClientServerProtocol.buildLoginFail("Invalid credentials"));
-                return;
+                return null;
             }
 
             out.println(ClientServerProtocol.buildLoginOk(
                     user.role(),
                     "Welcome " + user.name()));
 
-            //TODO: after login, open a post-login command loop
+            //after login, open a post-login command loop
             postLoginLoop(user, in, out);
+
+            return user;
 
         } catch (Exception e) {
             e.printStackTrace();
             out.println(ClientServerProtocol.buildError("LOGIN_ERROR"));
+            return null;
         }
     }
 
@@ -342,62 +345,63 @@ public class Server {
 
         @Override
         public void run() {
-            try (Socket s = this.socket;
-                 BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
-                 PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+            try (
+                    Socket s = this.socket;
+                    BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                    PrintWriter out = new PrintWriter(s.getOutputStream(), true)
+            ) {
 
-                // Read login request
-                String first = in.readLine();
-                //ClientServerProtocol.LoginRequest req = ClientServerProtocol.parseLoginRequest(first);
-                if (first == null) {
-                    out.println(ClientServerProtocol.buildError("EMPTY_REQUEST"));
-                    return;
-                }
+                User user = null;
 
-                String[] parts = first.trim().split("\\s+");
-                String cmd = parts[0].toUpperCase();
+                while (true) {
+                    String line = in.readLine();
+                    if (line == null)
+                        break;
 
-                switch (cmd) {
-                    case "LOGIN" -> handleLogin(parts, in, out);
-                    case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
-                    case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
-                    default -> {
-                        out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
-                        return;
+                    String[] parts = line.trim().split("\\s+");
+                    String cmd = parts[0].toUpperCase();
+
+                    switch (cmd) {
+                        case "LOGIN" -> {
+                            user = handleLogin(parts, in, out);
+                            // If login succeeded, user != null
+                        }
+
+                        case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
+                        case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
+
+                        default -> {
+                            if (user == null) {
+                                out.println(ClientServerProtocol.buildError("NOT_AUTHENTICATED"));
+                            } else {
+                                out.println("ECHO " + line);
+                            }
+                        }
                     }
                 }
-
-                /* Post-login: simple echo loop
-                String line;
-                while ((line = in.readLine()) != null) {
-                    // For now echo input back
-                    out.println("ECHO " + line);
-                } */
-
-
 
             } catch (IOException e) {
                 System.err.println("Client handler error: " + e.getMessage());
             }
         }
-    }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length != 4) {
-            System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");
-            return;
+        public static void main(String[] args) throws Exception {
+            if (args.length != 4) {
+                System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");
+                return;
+            }
+
+            InetAddress dirAddr = InetAddress.getByName(args[0]);
+            int dirPort = Integer.parseInt(args[1]);
+            File dbDir = new File(args[2]);
+            InetAddress mcIf = InetAddress.getByName(args[3]);
+
+            if (!dbDir.exists() && !dbDir.mkdirs()) {
+                System.err.println("Could not create dbDir: " + dbDir.getAbsolutePath());
+                return;
+            }
+
+            new Server(dirAddr, dirPort, dbDir, mcIf).start();
         }
-
-        InetAddress dirAddr = InetAddress.getByName(args[0]);
-        int dirPort = Integer.parseInt(args[1]);
-        File dbDir = new File(args[2]);
-        InetAddress mcIf = InetAddress.getByName(args[3]);
-
-        if (!dbDir.exists() && !dbDir.mkdirs()) {
-            System.err.println("Could not create dbDir: " + dbDir.getAbsolutePath());
-            return;
-        }
-
-        new Server(dirAddr, dirPort, dbDir, mcIf).start();
     }
 }
