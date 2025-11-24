@@ -2,6 +2,8 @@ package pt.isec.pdG36.proj.server.db;
 
 import java.nio.file.Path;
 import java.sql.*;
+import java.util.List;
+import java.util.UUID;
 
 public class DatabaseManager implements AutoCloseable {
     private final Path dbPath;
@@ -144,6 +146,51 @@ public class DatabaseManager implements AutoCloseable {
             }
         }
     }
+
+    public long insertQuestion(long teacherId,
+                               String statement,
+                               String startTime,
+                               String endTime,
+                               String accessCode) throws SQLException {
+        String sql = """
+                INSERT INTO questions (teacherId, statement, startTime, endTime, accessCode)
+                VALUES (?, ?, ?, ?, ?)
+                """;
+        try (PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            ps.setLong(1, teacherId);
+            ps.setString(2, statement);
+            ps.setString(3, startTime);
+            ps.setString(4, endTime);
+            ps.setString(5, accessCode);
+            ps.executeUpdate();
+
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                if (rs.next()) {
+                    return rs.getLong(1);
+                } else {
+                    throw new SQLException("Failed to obtain generated question id");
+                }
+            }
+        }
+    }
+
+    public void insertOption(long questionId,
+                             String code,
+                             String text,
+                             boolean isCorrect) throws SQLException {
+        String sql = """
+                INSERT INTO options (questionId, code, text, isCorrect)
+                VALUES (?, ?, ?, ?)
+            """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, questionId);
+            ps.setString(2, code);
+            ps.setString(3, text);
+            ps.setInt(4, isCorrect ? 1 : 0);
+            ps.executeUpdate();
+        }
+    }
+
     @Override
     public void close() throws SQLException {
         if (conn != null && !conn.isClosed())
@@ -155,3 +202,4 @@ public class DatabaseManager implements AutoCloseable {
         return conn;
     }
 }
+

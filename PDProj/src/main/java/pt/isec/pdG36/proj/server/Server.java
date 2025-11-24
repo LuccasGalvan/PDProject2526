@@ -6,6 +6,8 @@ import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
 import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
 import pt.isec.pdG36.proj.server.db.DatabaseManager;
 import pt.isec.pdG36.proj.server.db.User;
+import java.sql.Connection;
+import java.sql.SQLException;
 
 import javax.xml.crypto.Data;
 import java.io.*;
@@ -250,7 +252,7 @@ public class Server {
             //after login, open a post-login command loop
             postLoginLoop(user, in, out);
 
-            return user;
+            return null;
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -326,11 +328,131 @@ public class Server {
 
                 // future commands
                 case "CREATE_QUESTION" -> {
-                    // TODO step 5
+                    try {
+                        handleCreateQuestion(user, in, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("CREATE_QUESTION_ERROR"));
+                    }
                 }
 
                 default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
             }
+        }
+    }
+
+    private String generateAccessCode() {
+        String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid confusing chars like 0/O, 1/I
+        java.util.Random rnd = new java.util.Random();
+        StringBuilder sb = new StringBuilder(6);
+        for (int i = 0; i < 6; i++) {
+            sb.append(chars.charAt(rnd.nextInt(chars.length())));
+        }
+        return sb.toString();
+    }
+
+    private void handleCreateQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
+        // Only teachers can create questions
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        // 1) Ask for statement
+        out.println("Enter question statement:");
+        String statement = in.readLine();
+        if (statement == null || statement.isBlank()) {
+            out.println(ClientServerProtocol.buildError("EMPTY_STATEMENT"));
+            return;
+        }
+
+        // 2) Ask start/end time as simple strings for now
+        out.println("Enter start time (e.g., 2025-01-01T10:00):");
+        String startTime = in.readLine();
+        out.println("Enter end time (e.g., 2025-01-01T10:10):");
+        String endTime = in.readLine();
+
+        // 3) Ask number of options
+        int numOptions = 0;
+        while (true) {
+            out.println("Enter number of options (>= 2):");
+            String line = in.readLine();
+            if (line == null) {
+                out.println(ClientServerProtocol.buildError("ABORTED"));
+                return;
+            }
+            try {
+                numOptions = Integer.parseInt(line.trim());
+                if (numOptions >= 2)
+                    break;
+                out.println("Must be >= 2.");
+            } catch (NumberFormatException e) {
+                out.println("Invalid number, try again.");
+            }
+        }
+
+        // 4) Gather options
+        String[] codes = new String[numOptions];
+        String[] texts = new String[numOptions];
+        boolean[] correctFlags = new boolean[numOptions];
+        boolean isCorrect = false;
+
+        for (int i = 0; i < numOptions; i++) {
+            out.println("Option " + (i + 1) + " - code (e.g., A, B, C):");
+            codes[i] = in.readLine();
+
+            out.println("Option " + (i + 1) + " - text:");
+            texts[i] = in.readLine();
+
+            if(isCorrect == false){
+                out.println("Is this the correct option? (yes/no):");
+                String ans = in.readLine();
+                correctFlags[i] = ans != null && ans.trim().equalsIgnoreCase("yes");
+                isCorrect = true;
+            }
+        }
+
+        // Ensure at least one correct option
+        boolean anyCorrect = false;
+        for (boolean b : correctFlags) {
+            if (b) { anyCorrect = true; break; }
+        }
+        if (!anyCorrect) {
+            out.println(ClientServerProtocol.buildError("NO_CORRECT_OPTION"));
+            return;
+        }
+
+        // 5) Generate access code
+        String accessCode = generateAccessCode();
+
+        // 6) Store in DB with a transaction
+        Connection conn = dbManager.getConnection();
+        boolean oldAutoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try {
+            long qId = dbManager.insertQuestion(
+                    user.id(),       // teacherId
+                    statement,
+                    startTime,
+                    endTime,
+                    accessCode
+            );
+
+            for (int i = 0; i < numOptions; i++) {
+                dbManager.insertOption(qId, codes[i], texts[i], correctFlags[i]);
+            }
+
+            conn.commit();
+
+            out.println("CREATE_QUESTION_OK Access code: " + accessCode);
+
+
+        } catch (SQLException e) {
+            conn.rollback();
+            e.printStackTrace();
+            out.println(ClientServerProtocol.buildError("DB_ERROR_CREATING_QUESTION"));
+        } finally {
+            conn.setAutoCommit(oldAutoCommit);
         }
     }
 
@@ -384,24 +506,24 @@ public class Server {
                 System.err.println("Client handler error: " + e.getMessage());
             }
         }
-
-        public static void main(String[] args) throws Exception {
-            if (args.length != 4) {
-                System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");
-                return;
-            }
-
-            InetAddress dirAddr = InetAddress.getByName(args[0]);
-            int dirPort = Integer.parseInt(args[1]);
-            File dbDir = new File(args[2]);
-            InetAddress mcIf = InetAddress.getByName(args[3]);
-
-            if (!dbDir.exists() && !dbDir.mkdirs()) {
-                System.err.println("Could not create dbDir: " + dbDir.getAbsolutePath());
-                return;
-            }
-
-            new Server(dirAddr, dirPort, dbDir, mcIf).start();
-        }
     }
+    public static void main(String[] args) throws Exception {
+        if (args.length != 4) {
+            System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");
+            return;
+        }
+
+        InetAddress dirAddr = InetAddress.getByName(args[0]);
+        int dirPort = Integer.parseInt(args[1]);
+        File dbDir = new File(args[2]);
+        InetAddress mcIf = InetAddress.getByName(args[3]);
+
+        if (!dbDir.exists() && !dbDir.mkdirs()) {
+            System.err.println("Could not create dbDir: " + dbDir.getAbsolutePath());
+            return;
+        }
+
+        new Server(dirAddr, dirPort, dbDir, mcIf).start();
+    }
+
 }
