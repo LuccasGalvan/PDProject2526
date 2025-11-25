@@ -155,7 +155,6 @@ public class ClientMain {
         while ((line = keyboard.readLine()) != null) {
             if ("logout".equalsIgnoreCase(line)) {
                 System.out.println("[CLIENT] Logging out...");
-                // later we can send a LOGOUT command if you want the server to track sessions
                 return;
             }
 

@@ -1,4 +1,6 @@
 pt\isec\pdG36\proj\common\protocol\CommandType.class
+pt\isec\pdG36\proj\server\db\DatabaseManager$OptionDTO.class
+pt\isec\pdG36\proj\server\db\DatabaseManager$QuestionDTO.class
 pt\isec\pdG36\proj\common\protocol\DirectoryProtocol$ServerInfoResp.class
 pt\isec\pdG36\proj\server\Server.class
 pt\isec\pdG36\proj\common\protocol\ClientServerProtocol$LoginRequest.class

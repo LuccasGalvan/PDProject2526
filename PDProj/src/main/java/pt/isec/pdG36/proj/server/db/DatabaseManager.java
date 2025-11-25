@@ -191,6 +191,91 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    public record QuestionDTO(
+            long id,
+            long teacherId,
+            String statement,
+            String startTime,
+            String endTime,
+            String accessCode
+    ) {}
+
+    public record OptionDTO(
+            long id,
+            long questionId,
+            String code,
+            String text,
+            boolean isCorrect
+    ) {}
+
+    public QuestionDTO findQuestionByAccessCode(String accessCode) throws SQLException {
+        String sql = """
+                SELECT id, teacherId, statement, startTime, endTime, accessCode
+                FROM questions
+                WHERE accessCode = ?
+                """;
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, accessCode);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next())
+                    return null;
+
+                long id = rs.getLong("id");
+                long teacherId = rs.getLong("teacherId");
+                String statement = rs.getString("statement");
+                String startTime = rs.getString("startTime");
+                String endTime = rs.getString("endTime");
+                String code = rs.getString("accessCode");
+
+                return new QuestionDTO(id, teacherId, statement, startTime, endTime, code);
+            }
+        }
+    }
+
+    public java.util.List<OptionDTO> findOptionsForQuestion(long questionId) throws SQLException {
+        String sql = """
+                SELECT id, questionId, code, text, isCorrect
+                FROM options
+                WHERE questionId = ?
+                ORDER BY code
+                """;
+
+        java.util.List<OptionDTO> list = new java.util.ArrayList<>();
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, questionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long id = rs.getLong("id");
+                    long qid = rs.getLong("questionId");
+                    String code = rs.getString("code");
+                    String text = rs.getString("text");
+                    boolean isCorrect = rs.getInt("isCorrect") == 1;
+
+                    list.add(new OptionDTO(id, qid, code, text, isCorrect));
+                }
+            }
+        }
+
+        return list;
+    }
+
+    public void insertAnswer(long studentId, long questionId, String optionCode, String timestamp) throws SQLException {
+        String sql = """
+                INSERT INTO answers(studentId, questionId, optionCode, timestamp)
+                VALUES (?,?,?,?)
+                """;
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, studentId);
+            ps.setLong(2, questionId);
+            ps.setString(3, optionCode);
+            ps.setString(4, timestamp); // for now, plain string; later we can standardize format
+            ps.executeUpdate();
+        }
+    }
+
     @Override
     public void close() throws SQLException {
         if (conn != null && !conn.isClosed())

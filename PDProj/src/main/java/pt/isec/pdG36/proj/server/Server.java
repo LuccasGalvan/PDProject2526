@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import javax.xml.crypto.Data;
 import java.io.*;
 import java.net.*;
+import java.sql.*;
 
 public class Server {
 
@@ -336,6 +337,20 @@ public class Server {
                     }
                 }
 
+                case "ANSWER_QUESTION" -> {
+                    // only students can answer questions
+                    if (!"STUDENT".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_ANSWER"));
+                    } else {
+                        try {
+                            handleAnswerQuestion(user, in, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("ANSWER_QUESTION_ERROR"));
+                        }
+                    }
+                }
+
                 default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
             }
         }
@@ -453,6 +468,124 @@ public class Server {
             out.println(ClientServerProtocol.buildError("DB_ERROR_CREATING_QUESTION"));
         } finally {
             conn.setAutoCommit(oldAutoCommit);
+        }
+    }
+
+    private void handleAnswerQuestion(User user, BufferedReader in, PrintWriter out) throws IOException {
+        if (!"STUDENT".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_ANSWER"));
+            return;
+        }
+
+        out.println("Access code:");
+        String accessCode = in.readLine();
+        if (accessCode == null || accessCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
+            return;
+        }
+
+        try {
+            Connection conn = dbManager.getConnection();
+
+            // 1) Find question by access code
+            long questionId;
+            String statement;
+            String startStr;
+            String endStr;
+
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, statement, startTime, endTime FROM questions WHERE accessCode = ?")) {
+                ps.setString(1, accessCode.trim());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                        return;
+                    }
+                    questionId = rs.getLong("id");
+                    statement = rs.getString("statement");
+                    startStr = rs.getString("startTime");
+                    endStr = rs.getString("endTime");
+                }
+            }
+
+            // 2) Check if question is active (using ISO date-time strings)
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            java.time.LocalDateTime start = java.time.LocalDateTime.parse(startStr);
+            java.time.LocalDateTime end = java.time.LocalDateTime.parse(endStr);
+            if (now.isBefore(start) || now.isAfter(end)) {
+                out.println(ClientServerProtocol.buildError("QUESTION_NOT_ACTIVE"));
+                return;
+            }
+
+            // 3) Check if this student already answered this question
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT COUNT(*) FROM answers WHERE studentId = ? AND questionId = ?")) {
+                ps.setLong(1, user.id());
+                ps.setLong(2, questionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getInt(1) > 0) {
+                        out.println(ClientServerProtocol.buildError("ALREADY_ANSWERED"));
+                        return;
+                    }
+                }
+            }
+
+            // 4) Show question and options
+            out.println("Question: " + statement);
+            out.println("Options:");
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT code, text FROM options WHERE questionId = ? ORDER BY code")) {
+                ps.setLong(1, questionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String code = rs.getString("code");
+                        String text = rs.getString("text");
+                        out.println(code + ") " + text);
+                    }
+                }
+            }
+
+            // 5) Ask for option code
+            out.println("Enter option code:");
+            String optionCode = in.readLine();
+            if (optionCode == null || optionCode.isBlank()) {
+                out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
+                return;
+            }
+            optionCode = optionCode.trim();
+
+            // 6) Validate option code
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT COUNT(*) FROM options WHERE questionId = ? AND code = ?")) {
+                ps.setLong(1, questionId);
+                ps.setString(2, optionCode);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next() || rs.getInt(1) == 0) {
+                        out.println(ClientServerProtocol.buildError("INVALID_OPTION_CODE"));
+                        return;
+                    }
+                }
+            }
+
+            // 7) Insert answer
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES (?,?,?,?)")) {
+                ps.setLong(1, user.id());
+                ps.setLong(2, questionId);
+                ps.setString(3, optionCode);
+                ps.setString(4, java.time.LocalDateTime.now().toString());
+                ps.executeUpdate();
+            }
+
+            out.println("ANSWER_OK");
+
+            // TODO:
+            // - atualizar dbVersion
+            // - enviar heartbeat com a query SQL para réplicas
+
+        } catch (SQLException e) {
+            e.printStackTrace();
+            out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
         }
     }
 
