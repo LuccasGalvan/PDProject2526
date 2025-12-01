@@ -5,6 +5,7 @@ package pt.isec.pdG36.proj.server;
 import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
 import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
 import pt.isec.pdG36.proj.server.db.DatabaseManager;
+import pt.isec.pdG36.proj.server.db.PassUtil;
 import pt.isec.pdG36.proj.server.db.User;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -15,6 +16,11 @@ import java.net.*;
 import java.sql.*;
 
 public class Server {
+    // protects "DB write + version bump + replication" and DB file copying
+    private final Object dbLock = new Object();
+
+    private static final String MCAST_ADDR = "230.30.30.30";
+    private static final int MCAST_PORT = 3030;
 
     private final InetAddress dirAddr;
     private final int dirUdpPort;
@@ -118,33 +124,106 @@ public class Server {
         }
     }
 
-    private void initOrLoadLocalDbAsPrimary() {
+    private File chooseOrCreateDbFileForPrimary() throws IOException {
+        if (!dbDirectory.exists() && !dbDirectory.mkdirs()) {
+            throw new IOException("Could not create db directory: " + dbDirectory.getAbsolutePath());
+        }
+
+        File[] dbFiles = dbDirectory.listFiles((dir, name) -> name.endsWith(".db"));
+        if (dbFiles == null || dbFiles.length == 0) {
+            // no DBs yet -> create a new one with timestamp name
+            String filename = "quiz-" + System.currentTimeMillis() + ".db";
+            File f = new File(dbDirectory, filename);
+            System.out.println("[SERVER] Creating new primary DB file: " + f.getAbsolutePath());
+            return f;
+        }
+
+        // pick the most recently modified file
+        File newest = dbFiles[0];
+        for (File f : dbFiles) {
+            if (f.lastModified() > newest.lastModified()) {
+                newest = f;
+            }
+        }
+
+        System.out.println("[SERVER] Using existing primary DB file: " + newest.getAbsolutePath());
+        return newest;
+    }
+
+    private void initOrLoadLocalDb(boolean asPrimary) {
         try {
-            if (!dbDirectory.exists() && !dbDirectory.mkdirs()) {
-                System.err.println("[SERVER] Could not create db directory: " + dbDirectory.getAbsolutePath());
-                return;
+            File dbFile = chooseOrCreateDbFileForPrimary();
+
+            synchronized (dbLock) {
+                dbManager = new DatabaseManager(dbFile.toPath());
+                dbManager.connect();
+                dbManager.initSchema();
+                dbVersion = dbManager.getCurrentDbVersion();
             }
 
-            File dbFile = new File(dbDirectory, "quiz.db");
-            dbManager = new DatabaseManager(dbFile.toPath());
-            dbManager.connect();
-            dbManager.initSchema();
-            dbVersion = 0;
-            System.out.println("[SERVER] SQLite DB ready at " + dbFile.getAbsolutePath());
+            System.out.println("[SERVER] PRIMARY SQLite DB ready at " + dbFile.getAbsolutePath()
+                    + " (version = " + dbVersion + ")");
 
         } catch (Exception e) {
-            System.err.println("[SERVER] Error initializing DB: " + e.getMessage());
+            System.err.println("[SERVER] Error initializing DB as PRIMARY: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    private void obtainDbFromPrimary() {
-        // For now, we just behave like "ok, we got the DB"
-        System.out.println("[SERVER] (DUMMY) Would fetch DB from primary " +
-                primaryDbAddr.getHostAddress() + ":" + primaryDbPort);
+    private void initOrLoadLocalDbAsPrimary() {
+        initOrLoadLocalDb(true);
+    }
 
-        // Reuse the same dummy as primary so code paths are similar
-        initOrLoadLocalDbAsPrimary();
+    private void obtainDbFromPrimary() {
+        System.out.println("[SERVER] Fetching DB from primary "
+                + primaryDbAddr.getHostAddress() + ":" + primaryDbPort);
+
+        if (!dbDirectory.exists() && !dbDirectory.mkdirs()) {
+            System.err.println("[SERVER] Could not create db directory: " + dbDirectory.getAbsolutePath());
+            return;
+        }
+
+        // New local file name for this copy
+        File dbFile = new File(dbDirectory, "quiz-copy-" + System.currentTimeMillis() + ".db");
+
+        try (Socket socket = new Socket(primaryDbAddr, primaryDbPort);
+             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+             FileOutputStream fos = new FileOutputStream(dbFile)) {
+
+            long length = in.readLong();
+            byte[] buf = new byte[8192];
+            long remaining = length;
+
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buf.length, remaining);
+                int n = in.read(buf, 0, toRead);
+                if (n < 0) {
+                    throw new IOException("Unexpected EOF while receiving DB file");
+                }
+                fos.write(buf, 0, n);
+                remaining -= n;
+            }
+
+            fos.flush();
+
+            System.out.println("[SERVER] Received DB copy into " + dbFile.getAbsolutePath()
+                    + " (" + length + " bytes)");
+
+            synchronized (dbLock) {
+                dbManager = new DatabaseManager(dbFile.toPath());
+                dbManager.connect();
+                dbManager.initSchema();
+                dbVersion = dbManager.getCurrentDbVersion();
+            }
+
+            System.out.println("[SERVER] SECONDARY SQLite DB ready at " + dbFile.getAbsolutePath()
+                    + " (version = " + dbVersion + ")");
+
+        } catch (IOException | SQLException e) {
+            System.err.println("[SERVER] Error obtaining DB from primary: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1); // as per spec, if secondary can't sync it should die
+        }
     }
 
     private void startClientAcceptor() {
@@ -165,34 +244,105 @@ public class Server {
 
     private void startDbCopyAcceptor() {
         Thread t = new Thread(() -> {
-            System.out.println("DB copy acceptor running...");
             while (true) {
                 try {
                     Socket s = dbServerSocket.accept();
-                    // TODO: send or receive DB file as needed
-                    s.close(); // placeholder
+                    new Thread(() -> handleDbCopyRequest(s), "DbCopyHandler-" + s.getRemoteSocketAddress()).start();
                 } catch (IOException e) {
-                    System.err.println("DB accept error: " + e.getMessage());
-                    break;
+                    System.err.println("[SERVER] DB copy acceptor stopped: " + e.getMessage());
+                    return;
                 }
             }
         }, "DbCopyAcceptor");
+        t.setDaemon(true);
         t.start();
+    }
+
+    private void handleDbCopyRequest(Socket socket) {
+        try (socket;
+             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
+
+            // Only primary should serve DB copies
+            if (!isPrimary) {
+                System.out.println("[SERVER] Ignoring DB copy request on non-primary");
+                return;
+            }
+
+            File dbFile = dbManager.getDbFile().toFile();
+
+            synchronized (dbLock) {
+                long length = dbFile.length();
+                out.writeLong(length);
+
+                try (FileInputStream fis = new FileInputStream(dbFile)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = fis.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                    }
+                }
+                out.flush();
+            }
+
+            System.out.println("[SERVER] Sent DB copy (" + dbFile.getName() + ", " + dbFile.length() + " bytes)");
+
+        } catch (IOException e) {
+            System.err.println("[SERVER] Error handling DB copy request: " + e.getMessage());
+        }
     }
 
     private void startHeartbeatSender(int clientPort, int dbPort) {
         Thread t = new Thread(() -> {
             try (DatagramSocket udp = new DatagramSocket()) {
-                InetAddress mcastAddr = InetAddress.getByName("230.30.30.30");
-                int mcastPort = 3030;
+                InetAddress mcastAddr = InetAddress.getByName(MCAST_ADDR);
+
                 while (true) {
                     String hb = DirectoryProtocol.buildHeartbeat(clientPort, dbPort, dbVersion);
                     byte[] data = hb.getBytes();
 
-                    // to directory
-                    udp.send(new DatagramPacket(data, data.length, dirAddr, dirUdpPort));
-                    // to multicast group
-                    udp.send(new DatagramPacket(data, data.length, mcastAddr, mcastPort));
+                    System.out.println("[SERVER] Sending HEARTBEAT: " + hb);
+
+                    // 1) send to directory and wait for PRIMARY reply
+                    DatagramPacket toDir = new DatagramPacket(data, data.length, dirAddr, dirUdpPort);
+                    udp.send(toDir);
+
+                    try {
+                        udp.setSoTimeout(2000);
+                        byte[] buf = new byte[256];
+                        DatagramPacket resp = new DatagramPacket(buf, buf.length);
+                        udp.receive(resp);
+
+                        String reply = new String(resp.getData(), 0, resp.getLength()).trim();
+                        DirectoryProtocol.PrimaryInfo primaryInfo = DirectoryProtocol.parsePrimary(reply);
+                        if (primaryInfo != null) {
+                            InetAddress newPrimaryAddr = InetAddress.getByName(primaryInfo.ip());
+                            int newPrimaryDbPort = primaryInfo.dbPort();
+
+                            boolean oldIsPrimary = this.isPrimary;
+
+                            this.primaryDbAddr = newPrimaryAddr;
+                            this.primaryDbPort = newPrimaryDbPort;
+
+                            boolean samePort = (primaryDbPort == dbPort);
+                            boolean sameHost = true; // single-host assumptions for the project
+
+                            this.isPrimary = samePort && sameHost;
+
+                            if (!oldIsPrimary && this.isPrimary) {
+                                System.out.println("[SERVER] PROMOTED to PRIMARY by directory heartbeat");
+                            } else if (oldIsPrimary && !this.isPrimary) {
+                                System.out.println("[SERVER] DEMOTED from PRIMARY by directory heartbeat");
+                            }
+                        } else {
+                            System.err.println("[SERVER] Unexpected reply to HEARTBEAT: " + reply);
+                        }
+                    } catch (SocketTimeoutException ignored) {
+                        // directory didn’t answer this heartbeat -> ignore, try next time
+                    }
+
+                    // 2) send heartbeat (without SQL) to multicast group for liveness/consistency checking
+                    DatagramPacket toMcast = new DatagramPacket(data, data.length, mcastAddr, MCAST_PORT);
+                    udp.send(toMcast);
 
                     Thread.sleep(5000);
                 }
@@ -212,15 +362,86 @@ public class Server {
 
                 mcast.joinGroup(new InetSocketAddress(group, 3030), ni);
 
-                byte[] buf = new byte[512];
+                byte[] buf = new byte[2048];
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
 
                 while (true) {
                     mcast.receive(packet);
                     String msg = new String(packet.getData(), 0, packet.getLength()).trim();
-                    // Later:
-                    // - ignore our own
-                    // - if from PRIMARY & newer dbVersion, sync changes
+                    if (msg.isEmpty()) {
+                        continue;
+                    }
+
+                    if (!msg.startsWith("HEARTBEAT")) {
+                        // later we can handle other message types here
+                        continue;
+                    }
+
+                    DirectoryProtocol.HeartbeatInfo hb = DirectoryProtocol.parseHeartbeat(msg);
+                    if (hb == null) {
+                        System.err.println("[SERVER] Invalid multicast HEARTBEAT: " + msg);
+                        continue;
+                    }
+
+                    InetAddress senderAddr = packet.getAddress();
+
+                    // Ignore our own heartbeats
+                    boolean sameHost = senderAddr.equals(multicastIface);
+                    boolean sameClientPort = hb.clientPort() == clientServerSocket.getLocalPort();
+                    boolean sameDbPort = hb.dbPort() == dbServerSocket.getLocalPort();
+                    if (sameHost && sameClientPort && sameDbPort) {
+                        continue;
+                    }
+
+                    // PRIMARY never consumes replication from others
+                    if (isPrimary) {
+                        continue;
+                    }
+
+                    // SECONDARY: only care about OUR primary
+                    if (!senderAddr.equals(primaryDbAddr) || hb.dbPort() != primaryDbPort) {
+                        continue;
+                    }
+
+                    long remoteVersion = hb.dbVersion();
+                    long localVersion = this.dbVersion; // volatile
+
+                    String sql = DirectoryProtocol.extractSqlFromHeartbeat(msg);
+
+                    if (sql == null) {
+                        // Plain heartbeat -> liveness only, no version kill
+                        System.out.println("[SERVER] Plain HEARTBEAT from PRIMARY "
+                                + senderAddr.getHostAddress()
+                                + " remoteVersion=" + remoteVersion
+                                + " localVersion=" + localVersion);
+                        continue;
+                    }
+
+                    // SQL heartbeat -> replication step
+                    System.out.println("[SERVER] SQL HEARTBEAT from PRIMARY "
+                            + senderAddr.getHostAddress()
+                            + " remoteVersion=" + remoteVersion
+                            + " localVersion=" + localVersion
+                            + " sql=" + sql);
+
+                    // strict rule: must be exactly local+1
+                    if (remoteVersion != localVersion + 1) {
+                        System.err.println("[SERVER] DB VERSION MISMATCH on SQL update: "
+                                + "remoteVersion=" + remoteVersion
+                                + " localVersion=" + localVersion
+                                + " -> terminating (lost replication consistency).");
+                        System.exit(1);
+                    }
+
+                    // Apply SQL on secondary
+                    try (Statement st = dbManager.getConnection().createStatement()) {
+                        st.executeUpdate(sql);
+                        this.dbVersion = remoteVersion;
+                        System.out.println("[SERVER] Applied SQL from primary. New localVersion=" + this.dbVersion);
+                    } catch (SQLException e) {
+                        System.err.println("[SERVER] Failed to apply SQL from primary: " + e.getMessage());
+                        System.exit(1); // inconsistent -> die
+                    }
                 }
             } catch (IOException e) {
                 System.err.println("[SERVER] Multicast listener stopped: " + e.getMessage());
@@ -230,7 +451,55 @@ public class Server {
         t.start();
     }
 
+    private void sendSqlHeartbeatToSecondaries(String sql) {
+        if (!isPrimary) {
+            return;
+        }
+
+        try (DatagramSocket udp = new DatagramSocket()) {
+            InetAddress mcastAddr = InetAddress.getByName(MCAST_ADDR);
+
+            int clientPort = clientServerSocket.getLocalPort();
+            int dbPort = dbServerSocket.getLocalPort();
+            long version = this.dbVersion; // already bumped
+
+            String msg = DirectoryProtocol.buildHeartbeatWithSql(clientPort, dbPort, version, sql);
+            byte[] data = msg.getBytes();
+
+            DatagramPacket pkt = new DatagramPacket(data, data.length, mcastAddr, MCAST_PORT);
+            udp.send(pkt);
+
+            System.out.println("[SERVER] Sent SQL HEARTBEAT: " + msg);
+        } catch (IOException e) {
+            System.err.println("[SERVER] Failed to send SQL HEARTBEAT: " + e.getMessage());
+        }
+    }
+
+    /*
+    private void sendDbFileToSecondaries() {
+        if (!isPrimary) {
+            return;
+        }
+
+        try (DatagramSocket udp = new DatagramSocket()) {
+            InetAddress mcastAddr = InetAddress.getByName(MCAST_ADDR);
+
+            int clientPort = clientServerSocket.getLocalPort();
+            int dbPort = dbServerSocket.getLocalPort();
+            long version = this.dbVersion; // already bumped
+
+            String dbFilePath = dbManager.getDbPath();
+
+            String msg = DirectoryProtocol.buildDbFileHeartbeat(clientPort, dbPort, version, dbFilePath);
+
+        }catch(IOException e){
+            System.err.println("[SERVER] Failed to send DB file to secondaries: " + e.getMessage());
+        }
+    }
+    */
+
     private User handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
+        // Expected: parts[0] = "LOGIN", parts[1] = email, parts[2] = password
         if (parts.length < 3) {
             out.println(ClientServerProtocol.buildLoginFail("Missing credentials"));
             return null;
@@ -242,51 +511,126 @@ public class Server {
         try {
             User user = dbManager.authenticate(email, password);
             if (user == null) {
-                out.println(ClientServerProtocol.buildLoginFail("Invalid credentials"));
+                out.println(ClientServerProtocol.buildLoginFail("INVALID_CREDENTIALS"));
                 return null;
             }
-
-            out.println(ClientServerProtocol.buildLoginOk(
-                    user.role(),
-                    "Welcome " + user.name()));
-
-            //after login, open a post-login command loop
-            postLoginLoop(user, in, out);
-
-            return null;
-
-        } catch (Exception e) {
+            // Authentication OK: inform client and return authenticated user.
+            out.println(ClientServerProtocol.buildLoginOk(user.role(), user.name()));
+            return user;
+        } catch (SQLException e) {
             e.printStackTrace();
             out.println(ClientServerProtocol.buildError("LOGIN_ERROR"));
             return null;
         }
     }
 
+    /**
+     * Split incoming line into parts. For REGISTER_STUDENT and REGISTER_TEACHER payloads,
+     * fields are split by '|' (to allow spaces inside fields). For other commands, split by whitespace.
+     *
+     * Returned array: parts[0] = command (upper-case), subsequent indices = fields.
+     */
+    private String[] splitCommandLine(String line) {
+        if (line == null) return new String[0];
+        String trimmed = line.trim();
+        if (trimmed.isEmpty()) return new String[0];
+
+        int spaceIdx = trimmed.indexOf(' ');
+        String cmd = (spaceIdx == -1) ? trimmed.toUpperCase() : trimmed.substring(0, spaceIdx).toUpperCase();
+
+        if ("REGISTER_STUDENT".equalsIgnoreCase(cmd) || "REGISTER_TEACHER".equalsIgnoreCase(cmd)) {
+            if (spaceIdx == -1) {
+                // command without payload
+                return new String[]{cmd};
+            }
+            String payload = trimmed.substring(spaceIdx + 1);
+            // split preserving empty fields; trim each field
+            String[] fields = payload.split("\\|", -1);
+            String[] parts = new String[fields.length + 1];
+            parts[0] = cmd;
+            for (int i = 0; i < fields.length; i++) {
+                parts[i + 1] = fields[i] == null ? "" : fields[i].trim();
+            }
+            return parts;
+        } else {
+            // Default: split by whitespace. Keep simple tokenization for other commands.
+            // Use limit to preserve trailing message when relevant (e.g., LOGIN responses parsing handled elsewhere)
+            return trimmed.split("\\s+");
+        }
+    }
+
     private void handleRegisterStudent(String[] parts, PrintWriter out) {
-        // Example: REGISTER_STUDENT <number> <name> <email> <password>
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
         if (parts.length < 5) {
             out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
             return;
         }
 
-        int number = Integer.parseInt(parts[1]);
+        int number;
+        try {
+            number = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            out.println(ClientServerProtocol.buildRegisterFail("INVALID_NUMBER"));
+            return;
+        }
         String name = parts[2];
         String email = parts[3];
         String password = parts[4];
 
-        try {
-            boolean ok = dbManager.registerStudent(number, name, email, password);
-            if (ok)
-                out.println(ClientServerProtocol.buildRegisterOk("Student registered"));
-            else
-                out.println(ClientServerProtocol.buildRegisterFail("Duplicate email or number"));
-        } catch (Exception e) {
-            out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+        synchronized (dbLock) {
+            try {
+                DatabaseManager.RegisterResult res = dbManager.registerStudent(number, name, email, password);
+                switch (res) {
+                    case OK -> {
+                        try {
+                            long newVersion = Server.this.bumpDbVersion();
+
+                            if (isPrimary) {
+                                String passwordHash = PassUtil.hashPassword(password);
+
+                                String sqlForReplication =
+                                        "INSERT INTO users(role, student_number, name, email, password_hash) VALUES ("
+                                                + "'STUDENT',"
+                                                + number
+                                                + ",'"
+                                                + escapeSqlLiteral(name)
+                                                + "','"
+                                                + escapeSqlLiteral(email)
+                                                + "','"
+                                                + escapeSqlLiteral(passwordHash)
+                                                + "')";
+
+                                sendSqlHeartbeatToSecondaries(sqlForReplication);
+                            }
+
+                            out.println(ClientServerProtocol.buildRegisterOk("Student registered"));
+                        } catch (SQLException e) {
+                            System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after REGISTER_STUDENT: "
+                                    + e.getMessage());
+                            out.println(ClientServerProtocol.buildError("DB_ERROR"));
+                        }
+                    }
+                    case EMAIL_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("EMAIL_IN_USE"));
+                    case NUMBER_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("NUMBER_IN_USE"));
+                    default -> out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+                }
+            } catch (Exception e) {
+                out.println(ClientServerProtocol.buildError("DB_ERROR"));
+            }
         }
     }
 
     private void handleRegisterTeacher(String[] parts, PrintWriter out) {
-        // Example: REGISTER_TEACHER <number> <name> <email> <password>
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
+        // Example: REGISTER_TEACHER <name>|<email>|<password>|<teacherCode>
         if (parts.length < 5) {
             out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
             return;
@@ -295,16 +639,50 @@ public class Server {
         String name = parts[1];
         String email = parts[2];
         String password = parts[3];
-        String teacherCodeHash = parts[4];
+        String teacherCode = parts[4];
 
-        try {
-            boolean ok = dbManager.registerTeacher(name, email, password, teacherCodeHash);
-            if (ok)
-                out.println(ClientServerProtocol.buildRegisterOk("Teacher registered"));
-            else
-                out.println(ClientServerProtocol.buildRegisterFail("Duplicate email or number"));
-        } catch (Exception e) {
-            out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+        synchronized (dbLock) {
+            try {
+                DatabaseManager.RegisterResult res = dbManager.registerTeacher(name, email, password, teacherCode);
+                switch (res) {
+                    case OK -> {
+                        try {
+                            long newVersion = Server.this.bumpDbVersion();
+
+                            if (isPrimary) {
+                                String passwordHash = PassUtil.hashPassword(password);
+
+                                String sqlForReplication =
+                                        "INSERT INTO users(role, student_number, name, email, password_hash) VALUES ("
+                                                + "'TEACHER',"
+                                                + "NULL,"
+                                                + "'"
+                                                + escapeSqlLiteral(name)
+                                                + "','"
+                                                + escapeSqlLiteral(email)
+                                                + "','"
+                                                + escapeSqlLiteral(passwordHash)
+                                                + "')";
+
+                                sendSqlHeartbeatToSecondaries(sqlForReplication);
+                            }
+
+                            out.println(ClientServerProtocol.buildRegisterOk("Teacher registered"));
+                        } catch (SQLException e) {
+                            System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after REGISTER_TEACHER: "
+                                    + e.getMessage());
+                            out.println(ClientServerProtocol.buildError("DB_ERROR"));
+                        }
+                    }
+                    case EMAIL_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("EMAIL_IN_USE"));
+                    case NUMBER_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("NUMBER_IN_USE"));
+                    case DatabaseManager.RegisterResult.INVALID_TEACHER_CODE ->
+                            out.println(ClientServerProtocol.buildRegisterFail("INVALID_TEACHER_CODE"));
+                    default -> out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
+                }
+            } catch (Exception e) {
+                out.println(ClientServerProtocol.buildError("DB_ERROR"));
+            }
         }
     }
 
@@ -312,7 +690,7 @@ public class Server {
         String line;
         while ((line = in.readLine()) != null) {
 
-            String[] parts = line.trim().split("\\s+");
+            String[] parts = splitCommandLine(line);
             if (parts.length == 0)
                 continue;
 
@@ -357,7 +735,8 @@ public class Server {
     }
 
     private String generateAccessCode() {
-        String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid confusing chars like 0/O, 1/I
+        //TODO make sure theres no equal accesCodes in DB just in case
+        String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         java.util.Random rnd = new java.util.Random();
         StringBuilder sb = new StringBuilder(6);
         for (int i = 0; i < 6; i++) {
@@ -367,6 +746,11 @@ public class Server {
     }
 
     private void handleCreateQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
         // Only teachers can create questions
         if (!"TEACHER".equalsIgnoreCase(user.role())) {
             out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
@@ -441,152 +825,241 @@ public class Server {
         String accessCode = generateAccessCode();
 
         // 6) Store in DB with a transaction
-        Connection conn = dbManager.getConnection();
-        boolean oldAutoCommit = conn.getAutoCommit();
-        conn.setAutoCommit(false);
-        try {
-            long qId = dbManager.insertQuestion(
-                    user.id(),       // teacherId
-                    statement,
-                    startTime,
-                    endTime,
-                    accessCode
-            );
+        synchronized (dbLock) {
+            Connection conn = dbManager.getConnection();
+            boolean oldAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                long qId = dbManager.insertQuestion(
+                        user.id(),       // teacherId
+                        statement,
+                        startTime,
+                        endTime,
+                        accessCode
+                );
 
-            for (int i = 0; i < numOptions; i++) {
-                dbManager.insertOption(qId, codes[i], texts[i], correctFlags[i]);
+                for (int i = 0; i < numOptions; i++) {
+                    dbManager.insertOption(qId, codes[i], texts[i], correctFlags[i]);
+                }
+
+                conn.commit();
+
+                try {
+                    if (isPrimary) {
+                        // 1) replicate question INSERT (with explicit id)
+                        {
+                            long newVersion = Server.this.bumpDbVersion();
+
+                            String sqlQuestion =
+                                    "INSERT INTO questions(id, teacherId, statement, startTime, endTime, accessCode) VALUES ("
+                                            + qId + ","
+                                            + user.id()
+                                            + ",'"
+                                            + escapeSqlLiteral(statement)
+                                            + "','"
+                                            + escapeSqlLiteral(startTime)
+                                            + "','"
+                                            + escapeSqlLiteral(endTime)
+                                            + "','"
+                                            + escapeSqlLiteral(accessCode)
+                                            + "')";
+
+                            sendSqlHeartbeatToSecondaries(sqlQuestion);
+                        }
+
+                        // 2) replicate each option INSERT
+                        for (int i = 0; i < numOptions; i++) {
+                            long newVersion = Server.this.bumpDbVersion();
+
+                            String sqlOption =
+                                    "INSERT INTO options(questionId, code, text, isCorrect) VALUES ("
+                                            + qId
+                                            + ",'"
+                                            + escapeSqlLiteral(codes[i])
+                                            + "','"
+                                            + escapeSqlLiteral(texts[i])
+                                            + "',"
+                                            + (correctFlags[i] ? 1 : 0)
+                                            + ")";
+
+                            sendSqlHeartbeatToSecondaries(sqlOption);
+                        }
+                    }
+
+                    out.println("CREATE_QUESTION_OK Access code: " + accessCode);
+                } catch (SQLException e) {
+                    System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after CREATE_QUESTION: "
+                            + e.getMessage());
+                    out.println(ClientServerProtocol.buildError("DB_ERROR"));
+                }
+
+            } catch (SQLException e) {
+                conn.rollback();
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("DB_ERROR_CREATING_QUESTION"));
+
+            } finally {
+                conn.setAutoCommit(oldAutoCommit);
             }
-
-            conn.commit();
-
-            out.println("CREATE_QUESTION_OK Access code: " + accessCode);
-
-
-        } catch (SQLException e) {
-            conn.rollback();
-            e.printStackTrace();
-            out.println(ClientServerProtocol.buildError("DB_ERROR_CREATING_QUESTION"));
-        } finally {
-            conn.setAutoCommit(oldAutoCommit);
         }
     }
 
     private void handleAnswerQuestion(User user, BufferedReader in, PrintWriter out) throws IOException {
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
         if (!"STUDENT".equalsIgnoreCase(user.role())) {
             out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_ANSWER"));
             return;
         }
 
-        out.println("Access code:");
+        out.println("PROMPT Access code:");
         String accessCode = in.readLine();
         if (accessCode == null || accessCode.isBlank()) {
             out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
             return;
         }
 
-        try {
-            Connection conn = dbManager.getConnection();
+        synchronized (dbLock) {
+            try {
+                Connection conn = dbManager.getConnection();
 
-            // 1) Find question by access code
-            long questionId;
-            String statement;
-            String startStr;
-            String endStr;
+                long questionId;
+                String statement;
+                String startStr;
+                String endStr;
 
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT id, statement, startTime, endTime FROM questions WHERE accessCode = ?")) {
-                ps.setString(1, accessCode.trim());
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                        return;
-                    }
-                    questionId = rs.getLong("id");
-                    statement = rs.getString("statement");
-                    startStr = rs.getString("startTime");
-                    endStr = rs.getString("endTime");
-                }
-            }
-
-            // 2) Check if question is active (using ISO date-time strings)
-            java.time.LocalDateTime now = java.time.LocalDateTime.now();
-            java.time.LocalDateTime start = java.time.LocalDateTime.parse(startStr);
-            java.time.LocalDateTime end = java.time.LocalDateTime.parse(endStr);
-            if (now.isBefore(start) || now.isAfter(end)) {
-                out.println(ClientServerProtocol.buildError("QUESTION_NOT_ACTIVE"));
-                return;
-            }
-
-            // 3) Check if this student already answered this question
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT COUNT(*) FROM answers WHERE studentId = ? AND questionId = ?")) {
-                ps.setLong(1, user.id());
-                ps.setLong(2, questionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next() && rs.getInt(1) > 0) {
-                        out.println(ClientServerProtocol.buildError("ALREADY_ANSWERED"));
-                        return;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT id, statement, startTime, endTime FROM questions WHERE accessCode = ?")) {
+                    ps.setString(1, accessCode.trim());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                            return;
+                        }
+                        questionId = rs.getLong("id");
+                        statement = rs.getString("statement");
+                        startStr = rs.getString("startTime");
+                        endStr = rs.getString("endTime");
                     }
                 }
-            }
 
-            // 4) Show question and options
-            out.println("Question: " + statement);
-            out.println("Options:");
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT code, text FROM options WHERE questionId = ? ORDER BY code")) {
-                ps.setLong(1, questionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String code = rs.getString("code");
-                        String text = rs.getString("text");
-                        out.println(code + ") " + text);
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                java.time.LocalDateTime start = java.time.LocalDateTime.parse(startStr);
+                java.time.LocalDateTime end = java.time.LocalDateTime.parse(endStr);
+                if (now.isBefore(start) || now.isAfter(end)) {
+                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_ACTIVE"));
+                    return;
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT COUNT(*) FROM answers WHERE studentId = ? AND questionId = ?")) {
+                    ps.setLong(1, user.id());
+                    ps.setLong(2, questionId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next() && rs.getInt(1) > 0) {
+                            out.println(ClientServerProtocol.buildError("ALREADY_ANSWERED"));
+                            return;
+                        }
                     }
                 }
-            }
 
-            // 5) Ask for option code
-            out.println("Enter option code:");
-            String optionCode = in.readLine();
-            if (optionCode == null || optionCode.isBlank()) {
-                out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
-                return;
-            }
-            optionCode = optionCode.trim();
+                // \* construir a pergunta inteira numa string só \*
+                StringBuilder sb = new StringBuilder();
+                sb.append("Question: ").append(statement).append("\n");
+                sb.append("Options:").append("\n");
 
-            // 6) Validate option code
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT COUNT(*) FROM options WHERE questionId = ? AND code = ?")) {
-                ps.setLong(1, questionId);
-                ps.setString(2, optionCode);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next() || rs.getInt(1) == 0) {
-                        out.println(ClientServerProtocol.buildError("INVALID_OPTION_CODE"));
-                        return;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT code, text FROM options WHERE questionId = ? ORDER BY code")) {
+                    ps.setLong(1, questionId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            String code = rs.getString("code");
+                            String text = rs.getString("text");
+                            sb.append(code).append(") ").append(text).append("\n");
+                        }
                     }
                 }
+
+                // build full question text
+                String questionText = sb.toString().replace("\r", "");
+
+                // encode internal newlines as literal "\n"
+                questionText = questionText.replace("\n", "\\n");
+
+                // send as a single logical line
+                out.println("QUESTION_BLOCK " + questionText);
+
+                String optionCode = in.readLine();
+                if (optionCode == null || optionCode.isBlank()) {
+                    out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
+                    return;
+                }
+                optionCode = optionCode.trim();
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT COUNT(*) FROM options WHERE questionId = ? AND code = ?")) {
+                    ps.setLong(1, questionId);
+                    ps.setString(2, optionCode);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next() || rs.getInt(1) == 0) {
+                            out.println(ClientServerProtocol.buildError("INVALID_OPTION_CODE"));
+                            return;
+                        }
+                    }
+                }
+
+                String timestamp = java.time.LocalDateTime.now().toString();
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES (?,?,?,?)")) {
+                    ps.setLong(1, user.id());
+                    ps.setLong(2, questionId);
+                    ps.setString(3, optionCode);
+                    ps.setString(4, timestamp);
+                    ps.executeUpdate();
+                }
+
+                try {
+                    long newVersion = Server.this.bumpDbVersion();
+                    // Only the PRIMARY broadcasts SQL updates
+                    if (isPrimary) {
+                        String sqlForReplication =
+                                "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES ("
+                                        + user.id()
+                                        + ","
+                                        + questionId
+                                        + ",'"
+                                        + escapeSqlLiteral(optionCode)
+                                        + "','"
+                                        + escapeSqlLiteral(timestamp)
+                                        + "')";
+
+                        sendSqlHeartbeatToSecondaries(sqlForReplication);
+                    }
+                } catch (SQLException e) {
+                    System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after ANSWER_QUESTION: "
+                            + e.getMessage());
+                    out.println(ClientServerProtocol.buildError("DB_ERROR"));
+                    return;
+                }
+
+                out.println("ANSWER_OK");
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
             }
-
-            // 7) Insert answer
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES (?,?,?,?)")) {
-                ps.setLong(1, user.id());
-                ps.setLong(2, questionId);
-                ps.setString(3, optionCode);
-                ps.setString(4, java.time.LocalDateTime.now().toString());
-                ps.executeUpdate();
-            }
-
-            out.println("ANSWER_OK");
-
-            // TODO:
-            // - atualizar dbVersion
-            // - enviar heartbeat com a query SQL para réplicas
-
-        } catch (SQLException e) {
-            e.printStackTrace();
-            out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
         }
+    }
+
+    public synchronized long bumpDbVersion() throws SQLException {
+        long newVersion = dbManager.incrementDbVersion();
+        this.dbVersion = newVersion;
+        System.out.println("[SERVER] DB version bumped to " + newVersion);
+        return newVersion;
     }
 
     // Inner class for handling a client connection
@@ -600,6 +1073,7 @@ public class Server {
 
         @Override
         public void run() {
+            // try-with-resources garante fechamento de socket e streams ao sair do bloco (incl. em exceções)
             try (
                     Socket s = this.socket;
                     BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
@@ -610,36 +1084,64 @@ public class Server {
 
                 while (true) {
                     String line = in.readLine();
-                    if (line == null)
+                    if (line == null) // cliente fechou socket
                         break;
 
-                    String[] parts = line.trim().split("\\s+");
+                    String[] parts = splitCommandLine(line);
+                    if (parts.length == 0) continue;
                     String cmd = parts[0].toUpperCase();
 
                     switch (cmd) {
+                        //common stuff
                         case "LOGIN" -> {
+                            // handleLogin autentica e retorna o User em caso de sucesso.
+                            // Se obtivermos um User, entramos no loop de sessão (postLoginLoop)
                             user = handleLogin(parts, in, out);
-                            // If login succeeded, user != null
-                        }
-
-                        case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
-                        case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
-
-                        default -> {
-                            if (user == null) {
-                                out.println(ClientServerProtocol.buildError("NOT_AUTHENTICATED"));
-                            } else {
-                                out.println("ECHO " + line);
+                            if (user != null) {
+                                try {
+                                    postLoginLoop(user, in, out);
+                                } catch (IOException e) {
+                                    System.err.println(getName() + " - session IO error: " + e.getMessage());
+                                } finally {
+                                    // sessão terminada (logout ou erro) -> user volta a null (permitir novo login na mesma conexão)
+                                    user = null;
+                                }
                             }
+                        }
+                        case "EDIT_PROFILE" -> {continue;} // to be implemented - edit profile of logged-in user (name, email, password)
+
+                        //student stuff
+                        case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
+                        case "LIST_MY_ANSWERS" -> {continue;} // to be implemented - list questions answered by the logged-in student (shows questions, options, and whether the answer was correct)
+
+                        //teacher stuff
+                        case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
+                        case "LIST_MY_QUESTIONS" -> {continue;} // to be implemented - list questions created by the logged-in teacher (shows questions, options, % of correct answers, and info of all students who answered each question)
+                        case "VIEW_RESULTS" -> {continue;} // to be implemented - view results of a specific question created by the logged-in teacher (shows options, % of correct answers, and info of all students who answered the question)
+                        case "EXPORT_RESULTS" -> {continue;} // to be implemented - export results of a specific question created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
+                        case "EXPORT_ALL_RESULTS" -> {continue;} // to be implemented - export results of all questions created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
+                        default -> {
+                            // When not authenticated, only LOGIN and REGISTER_* are allowed.
+                            // Any other command should be rejected.
+                            out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN_OR_UNKNOWN_CMD"));
                         }
                     }
                 }
 
             } catch (IOException e) {
                 System.err.println("Client handler error: " + e.getMessage());
+            } finally {
+                // try-with-resources já fecha socket/streams; log opcional para debug/monitorização
+                System.out.println(getName() + " - connection closed and resources cleaned up.");
             }
         }
     }
+
+    private static String escapeSqlLiteral(String value) {
+        if (value == null) return "";
+        return value.replace("'", "''");
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length != 4) {
             System.out.println("Usage: java Server <dirIP> <dirUdpPort> <dbDir> <multicastInterfaceIp>");

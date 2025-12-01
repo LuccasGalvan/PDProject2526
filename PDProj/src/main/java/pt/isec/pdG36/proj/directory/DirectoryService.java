@@ -50,7 +50,7 @@ public class DirectoryService {
 
         switch (cmd) {
             case "REGISTER" -> onRegister(parts, srcAddr, srcPort);
-            case "HEARTBEAT" -> onHeartbeat(parts, srcAddr);
+            case "HEARTBEAT" -> onHeartbeat(msg, srcAddr, srcPort);
             case "UNREGISTER" -> onUnregister(parts, srcAddr);
             case "GET_SERVER" -> onGetServer(srcAddr, srcPort);
             default -> {
@@ -80,13 +80,33 @@ public class DirectoryService {
         }
     }
 
-    private void onHeartbeat(String[] parts, InetAddress addr) {
-        if (parts.length < 4) return;
-        int clientPort = Integer.parseInt(parts[1]);
-        int dbPort = Integer.parseInt(parts[2]);
-        // parts[3] = dbVersion (ignored here)
+    private void onHeartbeat(String msg, InetAddress addr, int replyPort) {
+        DirectoryProtocol.HeartbeatInfo hb = DirectoryProtocol.parseHeartbeat(msg);
+        if (hb == null) {
+            System.err.println("[DIR] Invalid HEARTBEAT from " + addr + " -> " + msg);
+            return;
+        }
 
-        registry.heartbeat(addr, clientPort, dbPort, System.currentTimeMillis());
+        registry.heartbeat(
+                addr,
+                hb.clientPort(),
+                hb.dbPort(),
+                System.currentTimeMillis()
+        );
+
+        // update primary if needed
+        ServerInfo primary = registry.getPrimary();
+        if (primary != null) {
+            String resp = DirectoryProtocol.buildPrimaryReply(
+                    primary.getAddress().getHostAddress(),
+                    primary.getDbTcpPort()
+            );
+            try {
+                sendUdp(resp, addr, replyPort);
+            } catch (IOException e) {
+                System.err.println("[DIR] Failed to reply to HEARTBEAT: " + e.getMessage());
+            }
+        }
     }
 
     private void onUnregister(String[] parts, InetAddress addr) {
@@ -126,7 +146,7 @@ public class DirectoryService {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 1) {
-            System.out.println("Usage: java DirectoryService <udpPort>");
+            System.out.println("Usage: <udpPort>");
             return;
         }
         int udpPort = Integer.parseInt(args[0]);

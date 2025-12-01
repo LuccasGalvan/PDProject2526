@@ -22,13 +22,23 @@ public class ClientConnection {
     //public API
 
     public boolean connectToPrimary() {
-        DirectoryProtocol.ServerInfoResp ep = requestPrimaryFromDirectory();
-        if (ep == null) {
-            System.err.println("[CLIENT] No available server from directory.");
-            return false;
+        for (int attempt = 1; attempt <= 10; attempt++) {
+            DirectoryProtocol.ServerInfoResp ep = requestPrimaryFromDirectory();
+            if (ep == null) {
+                System.err.println("[CLIENT] No server available (attempt " + attempt + ")");
+                sleep(1000);
+                continue;
+            }
+
+            if (connectToServer(ep.ip(), ep.clientPort())) {
+                return true;
+            }
+
+            System.err.println("[CLIENT] Failed to connect to suggested server (attempt " + attempt + ")");
+            sleep(1000);
         }
 
-        return connectToServer(ep.ip(), ep.clientPort());
+        return false;
     }
 
     public boolean reconnectToPrimary() {
@@ -92,7 +102,7 @@ public class ClientConnection {
         try {
             System.out.println("[CLIENT] Connecting to server " + host + ":" + port + " ...");
             this.serverSocket = new Socket(host, port);
-            this.serverSocket.setSoTimeout(30_000); // use smaller while doing blocking reads if needed
+            this.serverSocket.setSoTimeout(30_000);
 
             this.in = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
             this.out = new PrintWriter(serverSocket.getOutputStream(), true);
@@ -106,6 +116,10 @@ public class ClientConnection {
         }
     }
 
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+    }
+
     private void closeSilently() {
         try {
             if (serverSocket != null) serverSocket.close();
@@ -113,6 +127,23 @@ public class ClientConnection {
         serverSocket = null;
         in = null;
         out = null;
+    }
+
+    public String safeReadLine() {
+        try {
+            return readLine();
+        } catch (IOException e) {
+            System.err.println("[CLIENT] Lost connection to current server: " + e.getMessage());
+            System.err.println("[CLIENT] Attempting to reconnect to new primary...");
+
+            if (reconnectToPrimary()) {
+                System.out.println("[CLIENT] Reconnected to new primary. Please retry the command.");
+            } else {
+                System.err.println("[CLIENT] Could not reconnect. Cluster may be unstable.");
+            }
+
+            return null; // caller detects null and returns to menu gracefully
+        }
     }
 
     private record ServerEndpoint(String host, int port) {}

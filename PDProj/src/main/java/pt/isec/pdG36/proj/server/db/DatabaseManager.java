@@ -24,6 +24,19 @@ public class DatabaseManager implements AutoCloseable {
         this.conn = DriverManager.getConnection(url);
     }
 
+    public Path getDbFile() {
+        return dbPath;
+    }
+
+    // Resultado explícito para operações de registo
+    public enum RegisterResult {
+        OK,
+        EMAIL_IN_USE,
+        NUMBER_IN_USE,
+        INVALID_TEACHER_CODE,
+        DB_ERROR
+    }
+
     // This will only create the tables for the database
     public void initSchema() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
@@ -40,11 +53,20 @@ public class DatabaseManager implements AutoCloseable {
             VALUES (1, 0);
         """);
 
+            // config: key/value para configurações simples
+            stmt.executeUpdate("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        """);
+
+            // users: garantir UNIQUE em email e student_number
             stmt.executeUpdate("""
             CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             role TEXT NOT NULL CHECK (role IN ('TEACHER','STUDENT')),
-            student_number INTEGER,
+            student_number INTEGER UNIQUE,
             name TEXT NOT NULL,
             email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL
@@ -86,11 +108,20 @@ public class DatabaseManager implements AutoCloseable {
             );
         """);
 
+            // Garantir valor por defeito para TEACHER_CODE_HASH
+            String defaultCodeHash = PassUtil.hashPassword("DEFAULT_TEACHER_CODE");
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)")) {
+                ps.setString(1, "TEACHER_CODE_HASH");
+                ps.setString(2, defaultCodeHash);
+                ps.executeUpdate();
+            }
+
             System.out.println("[DB] Schema initialized.");
         }
     }
 
-    public boolean registerStudent(int number, String name, String email, String password) throws SQLException {
+    public RegisterResult registerStudent(int number, String name, String email, String password) throws SQLException {
         String sql = "INSERT INTO users(role, student_number, name, email, password_hash) VALUES (?,?,?,?,?)";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, "STUDENT");
@@ -99,15 +130,46 @@ public class DatabaseManager implements AutoCloseable {
             ps.setString(4, email);
             ps.setString(5, PassUtil.hashPassword(password));
             ps.executeUpdate();
-            return true;
+
+            return RegisterResult.OK;
         } catch (SQLException e) {
-            // duplicate email or number etc.
-            return false;
+            String msg = e.getMessage();
+            if (msg != null) {
+                if (msg.contains("student_number") || msg.contains("users.student_number")) {
+                    return RegisterResult.NUMBER_IN_USE;
+                }
+                if (msg.contains("email") || msg.contains("users.email")) {
+                    return RegisterResult.EMAIL_IN_USE;
+                }
+            }
+            return RegisterResult.DB_ERROR;
         }
     }
 
-    public boolean registerTeacher(String name, String email, String password, String teacherCodeHash) throws SQLException {
-        // OPTIONAL for now: validate teacherCodeHash vs config table
+    public RegisterResult registerTeacher(String name, String email, String password, String teacherCode) throws SQLException {
+        // 1) obter TEACHER_CODE_HASH da tabela config
+        String storedHash = null;
+        try (PreparedStatement ps = conn.prepareStatement("SELECT value FROM config WHERE key = ?")) {
+            ps.setString(1, "TEACHER_CODE_HASH");
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    storedHash = rs.getString(1);
+                }
+            }
+        }
+
+        if (storedHash == null) {
+            // configuração ausente -> erro DB
+            return RegisterResult.DB_ERROR;
+        }
+
+        // 2) comparar hashes
+        String providedHash = PassUtil.hashPassword(teacherCode);
+        if (!storedHash.equals(providedHash)) {
+            return RegisterResult.INVALID_TEACHER_CODE;
+        }
+
+        // 3) se ok, inserir professor
         String sql = "INSERT INTO users(role, student_number, name, email, password_hash) VALUES (?,?,?,?,?)";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, "TEACHER");
@@ -116,10 +178,24 @@ public class DatabaseManager implements AutoCloseable {
             ps.setString(4, email);
             ps.setString(5, PassUtil.hashPassword(password));
             ps.executeUpdate();
-            return true;
+
+            return RegisterResult.OK;
         } catch (SQLException e) {
-            return false;
+            String msg = e.getMessage();
+            if (msg != null) {
+                if (msg.contains("student_number") || msg.contains("users.student_number")) {
+                    return RegisterResult.NUMBER_IN_USE;
+                }
+                if (msg.contains("email") || msg.contains("users.email")) {
+                    return RegisterResult.EMAIL_IN_USE;
+                }
+            }
+            return RegisterResult.DB_ERROR;
         }
+    }
+
+    public String getDbPath() {
+        return dbPath.toString();
     }
 
     public User authenticate(String email, String password) throws SQLException {
@@ -164,6 +240,7 @@ public class DatabaseManager implements AutoCloseable {
             ps.setString(5, accessCode);
             ps.executeUpdate();
 
+
             try (ResultSet rs = ps.getGeneratedKeys()) {
                 if (rs.next()) {
                     return rs.getLong(1);
@@ -188,6 +265,7 @@ public class DatabaseManager implements AutoCloseable {
             ps.setString(3, text);
             ps.setInt(4, isCorrect ? 1 : 0);
             ps.executeUpdate();
+
         }
     }
 
@@ -271,9 +349,36 @@ public class DatabaseManager implements AutoCloseable {
             ps.setLong(1, studentId);
             ps.setLong(2, questionId);
             ps.setString(3, optionCode);
-            ps.setString(4, timestamp); // for now, plain string; later we can standardize format
+            ps.setString(4, timestamp); // standardize later maybe
             ps.executeUpdate();
+
         }
+    }
+
+    // --- DB VERSIONING ----------------------------------------------------
+
+    public long getCurrentDbVersion() throws SQLException {
+        String sql = "SELECT version FROM version WHERE id = 1";
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) {
+                throw new SQLException("version row missing");
+            }
+            return rs.getLong("version");
+        }
+    }
+
+    //  increments the db version and returns new value
+    public long incrementDbVersion() throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE version SET version = version + 1 WHERE id = 1")) {
+            int updated = ps.executeUpdate();
+            if (updated != 1) {
+                throw new SQLException("Failed to update DB version");
+            }
+        }
+
+        return getCurrentDbVersion();
     }
 
     @Override

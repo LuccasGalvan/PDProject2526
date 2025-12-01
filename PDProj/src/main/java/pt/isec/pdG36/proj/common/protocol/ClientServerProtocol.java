@@ -30,12 +30,13 @@ public final class ClientServerProtocol {
         return ERROR + " " + (message == null ? "" : message);
     }
 
+    // Now use '|' as delimiter for multi-word fields after the command token.
     public static String buildRegisterStudentRequest(int number, String name, String email, String password) {
-        return REGISTER_STUDENT + " " + number + " " + name + " " + email + " " + password;
+        return REGISTER_STUDENT + " " + number + "|" + name + "|" + email + "|" + password;
     }
 
     public static String buildRegisterTeacherRequest(String name, String email, String password, String teacherCodeHash) {
-        return REGISTER_TEACHER + " " + name + " " + email + " " + password + " " + teacherCodeHash;
+        return REGISTER_TEACHER + " " + name + "|" + email + "|" + password + "|" + teacherCodeHash;
     }
 
     public static String buildRegisterOk(String message) {
@@ -45,10 +46,11 @@ public final class ClientServerProtocol {
     public static String buildRegisterFail(String message) {
         return REGISTER_FAIL + " " + (message == null ? "" : message);
     }
+
     // Records
     public record LoginResponse(boolean success, String role, String message) {}
-    public record LoginRequest(String username, String password) {}
     public record RegisterResponse(boolean success, String message) {}
+
     // Parsers
     public static LoginResponse parseLoginResponse(String line) {
         if (line == null) return null;
@@ -86,17 +88,6 @@ public final class ClientServerProtocol {
             return new RegisterResponse(false, msg);
         } else if (ERROR.equals(cmd)) {
             return new RegisterResponse(false, "ERROR: " + msg);
-        }
-        return null;
-    }
-
-    public static LoginRequest parseLoginRequest(String line) {
-        if (line == null) return null;
-        String trimmed = line.trim();
-        if (trimmed.isEmpty()) return null;
-        String[] parts = trimmed.split("\\s+", 3);
-        if (parts.length >= 3 && LOGIN.equals(parts[0])) {
-            return new LoginRequest(parts[1], parts[2]);
         }
         return null;
     }
