@@ -269,6 +269,15 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    public record StudentAnswerDTO(
+            long questionId,
+            String statement,
+            String startTime,
+            String endTime,
+            String optionCode,
+            boolean correct
+    ) {}
+
     public record QuestionDTO(
             long id,
             long teacherId,
@@ -309,6 +318,86 @@ public class DatabaseManager implements AutoCloseable {
                 return new QuestionDTO(id, teacherId, statement, startTime, endTime, code);
             }
         }
+    }
+
+    public java.util.List<StudentAnswerDTO> findClosedAnswersForStudent(long studentId) throws SQLException {
+        String sql = """
+                SELECT
+                    q.id            AS qid,
+                    q.statement     AS statement,
+                    q.startTime     AS startTime,
+                    q.endTime       AS endTime,
+                    a.optionCode    AS optionCode,
+                    o.isCorrect     AS isCorrect
+                FROM answers a
+                JOIN questions q
+                     ON q.id = a.questionId
+                LEFT JOIN options o
+                     ON o.questionId = q.id
+                    AND o.code = a.optionCode
+                WHERE a.studentId = ?
+                  AND q.endTime < ?
+                ORDER BY q.endTime DESC
+                """;
+
+        String now = java.time.LocalDateTime.now().toString();
+
+        java.util.List<StudentAnswerDTO> list = new java.util.ArrayList<>();
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, studentId);
+            ps.setString(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long qid = rs.getLong("qid");
+                    String stmt = rs.getString("statement");
+                    String start = rs.getString("startTime");
+                    String end = rs.getString("endTime");
+                    String optionCode = rs.getString("optionCode");
+
+                    boolean correct = false;
+                    int isCorrectInt = rs.getInt("isCorrect");
+                    if (!rs.wasNull()) {
+                        correct = (isCorrectInt == 1);
+                    }
+
+                    list.add(new StudentAnswerDTO(
+                            qid, stmt, start, end, optionCode, correct
+                    ));
+                }
+            }
+        }
+
+        return list;
+    }
+
+    public java.util.List<QuestionDTO> findQuestionsByTeacher(long teacherId) throws SQLException {
+        String sql = """
+                SELECT id, teacherId, statement, startTime, endTime, accessCode
+                FROM questions
+                WHERE teacherId = ?
+                ORDER BY startTime DESC
+                """;
+
+        java.util.List<QuestionDTO> list = new java.util.ArrayList<>();
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, teacherId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long id = rs.getLong("id");
+                    long tid = rs.getLong("teacherId");
+                    String statement = rs.getString("statement");
+                    String start = rs.getString("startTime");
+                    String end = rs.getString("endTime");
+                    String code = rs.getString("accessCode");
+
+                    list.add(new QuestionDTO(id, tid, statement, start, end, code));
+                }
+            }
+        }
+
+        return list;
     }
 
     public java.util.List<OptionDTO> findOptionsForQuestion(long questionId) throws SQLException {

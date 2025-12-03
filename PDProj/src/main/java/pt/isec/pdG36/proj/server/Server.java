@@ -729,6 +729,32 @@ public class Server {
                     }
                 }
 
+                case "LIST_MY_ANSWERS" -> {
+                    if (!"STUDENT".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_LIST_ANSWERS"));
+                    } else {
+                        try {
+                            handleListMyAnswers(user, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("LIST_MY_ANSWERS_ERROR"));
+                        }
+                    }
+                }
+
+                case "LIST_MY_QUESTIONS" -> {
+                    if (!"TEACHER".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("ONLY_TEACHERS_CAN_LIST_QUESTIONS"));
+                    } else {
+                        try {
+                            handleListMyQuestions(user, parts, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("LIST_MY_QUESTIONS_ERROR"));
+                        }
+                    }
+                }
+
                 default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
             }
         }
@@ -743,6 +769,92 @@ public class Server {
             sb.append(chars.charAt(rnd.nextInt(chars.length())));
         }
         return sb.toString();
+    }
+
+    private void handleListMyAnswers(User user, PrintWriter out) throws SQLException {
+        synchronized (dbLock) {
+            java.util.List<DatabaseManager.StudentAnswerDTO> answers =
+                    dbManager.findClosedAnswersForStudent(user.id());
+
+            StringBuilder sb = new StringBuilder();
+            if (answers.isEmpty()) {
+                sb.append("== You have no answered questions whose answering time has expired ==\n");
+            } else {
+                sb.append("== Your answered questions (closed) ==\n");
+                int idx = 1;
+                for (DatabaseManager.StudentAnswerDTO a : answers) {
+                    // compute state string just for info
+                    java.time.LocalDateTime start = java.time.LocalDateTime.parse(a.startTime());
+                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(a.endTime());
+
+                    sb.append(idx++).append(") [Q").append(a.questionId()).append("] ")
+                            .append(a.statement()).append("\n")
+                            .append("   Start: ").append(start).append(" | End: ").append(end).append("\n")
+                            .append("   Your answer: ").append(a.optionCode())
+                            .append(" -> ").append(a.correct() ? "CORRECT" : "WRONG")
+                            .append("\n\n");
+                }
+            }
+
+            // encode as BLOCK
+            String payload = sb.toString().replace("\r", "").replace("\n", "\\n");
+            out.println("BLOCK " + payload);
+        }
+    }
+
+    private void handleListMyQuestions(User user, String[] parts, PrintWriter out) throws SQLException {
+        String filter = "ALL";
+        if (parts.length >= 2) {
+            filter = parts[1].toUpperCase(); // SCHEDULED | ONGOING | CLOSED | ALL
+        }
+
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+
+        synchronized (dbLock) {
+            java.util.List<DatabaseManager.QuestionDTO> questions =
+                    dbManager.findQuestionsByTeacher(user.id());
+
+            StringBuilder sb = new StringBuilder();
+            if (questions.isEmpty()) {
+                sb.append("== You have not created any questions yet ==\n");
+            } else {
+                sb.append("== Your questions ==\n");
+                int idx = 1;
+                for (DatabaseManager.QuestionDTO q : questions) {
+                    java.time.LocalDateTime start = java.time.LocalDateTime.parse(q.startTime());
+                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
+
+                    String state;
+                    if (now.isBefore(start)) {
+                        state = "SCHEDULED";
+                    } else if (now.isAfter(end)) {
+                        state = "CLOSED";
+                    } else {
+                        state = "ONGOING";
+                    }
+
+                    // apply filter
+                    if (!"ALL".equals(filter) && !state.equalsIgnoreCase(filter)) {
+                        continue;
+                    }
+
+                    sb.append(idx++).append(") [Q").append(q.id()).append("] ")
+                            .append(q.statement()).append("\n")
+                            .append("   State: ").append(state)
+                            .append(" | Start: ").append(start)
+                            .append(" | End: ").append(end).append("\n")
+                            .append("   Access code: ").append(q.accessCode())
+                            .append("\n\n");
+                }
+
+                if (sb.toString().endsWith("== Your questions ==\n")) {
+                    sb.append("No questions match the given filter.\n");
+                }
+            }
+
+            String payload = sb.toString().replace("\r", "").replace("\n", "\\n");
+            out.println("BLOCK " + payload);
+        }
     }
 
     private void handleCreateQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
@@ -1112,11 +1224,11 @@ public class Server {
 
                         //student stuff
                         case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
-                        case "LIST_MY_ANSWERS" -> {continue;} // to be implemented - list questions answered by the logged-in student (shows questions, options, and whether the answer was correct)
+                        case "LIST_MY_ANSWERS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN")); // to be implemented - list questions answered by the logged-in student (shows questions, options, and whether the answer was correct)
 
                         //teacher stuff
                         case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
-                        case "LIST_MY_QUESTIONS" -> {continue;} // to be implemented - list questions created by the logged-in teacher (shows questions, options, % of correct answers, and info of all students who answered each question)
+                        case "LIST_MY_QUESTIONS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN"));
                         case "VIEW_RESULTS" -> {continue;} // to be implemented - view results of a specific question created by the logged-in teacher (shows options, % of correct answers, and info of all students who answered the question)
                         case "EXPORT_RESULTS" -> {continue;} // to be implemented - export results of a specific question created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
                         case "EXPORT_ALL_RESULTS" -> {continue;} // to be implemented - export results of all questions created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)

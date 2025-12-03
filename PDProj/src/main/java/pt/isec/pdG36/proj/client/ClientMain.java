@@ -222,6 +222,20 @@ public class ClientMain {
                     continue;
                 }
 
+                // 1.5) generic BLOCK (multi-line info, no extra input)
+                if (trimmed.startsWith("BLOCK ")) {
+                    String payload = trimmed.substring("BLOCK ".length());
+                    payload = payload.replace("\\n", "\n");
+
+                    String[] lines = payload.split("\n");
+                    for (String l : lines) {
+                        if (!l.isEmpty()) {
+                            System.out.println(l);
+                        }
+                    }
+                    continue;
+                }
+
                 // 2) generic prompts (including "PROMPT Access code:")
                 System.out.println("SERVER: " + serverResp);
                 if (trimmed.startsWith("PROMPT ") || trimmed.endsWith(":")) {
