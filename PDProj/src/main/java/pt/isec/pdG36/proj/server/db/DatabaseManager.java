@@ -8,6 +8,7 @@ import java.util.UUID;
 public class DatabaseManager implements AutoCloseable {
     private final Path dbPath;
     private Connection conn;
+    private static final String DEFAULT_TEACHER_CODE = "PD2025";
 
     public DatabaseManager(Path dbPath) {
         this.dbPath = dbPath;
@@ -109,7 +110,7 @@ public class DatabaseManager implements AutoCloseable {
         """);
 
             // Garantir valor por defeito para TEACHER_CODE_HASH
-            String defaultCodeHash = PassUtil.hashPassword("DEFAULT_TEACHER_CODE");
+            String defaultCodeHash = PassUtil.hashPassword(DEFAULT_TEACHER_CODE);
             try (PreparedStatement ps = conn.prepareStatement(
                     "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)")) {
                 ps.setString(1, "TEACHER_CODE_HASH");
