@@ -295,6 +295,15 @@ public class DatabaseManager implements AutoCloseable {
             boolean isCorrect
     ) {}
 
+    public record AnswerResultRow(
+            String timestamp,
+            Integer studentNumber,
+            String studentName,
+            String studentEmail,
+            String optionCode,
+            boolean correct
+    ) {}
+
     public QuestionDTO findQuestionByAccessCode(String accessCode) throws SQLException {
         String sql = """
                 SELECT id, teacherId, statement, startTime, endTime, accessCode
@@ -393,6 +402,47 @@ public class DatabaseManager implements AutoCloseable {
                     String code = rs.getString("accessCode");
 
                     list.add(new QuestionDTO(id, tid, statement, start, end, code));
+                }
+            }
+        }
+
+        return list;
+    }
+
+    public java.util.List<AnswerResultRow> findAnswersForQuestion(long questionId) throws SQLException {
+        String sql = """
+            SELECT a.timestamp,
+                   u.student_number,
+                   u.name,
+                   u.email,
+                   a.optionCode,
+                   CASE WHEN o.isCorrect = 1 THEN 1 ELSE 0 END AS isCorrectAnswer
+            FROM answers a
+            JOIN users u ON u.id = a.studentId
+            LEFT JOIN options o
+                   ON o.questionId = a.questionId
+                  AND o.code = a.optionCode
+            WHERE a.questionId = ?
+            ORDER BY a.timestamp
+            """;
+
+        java.util.List<AnswerResultRow> list = new java.util.ArrayList<>();
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, questionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String ts = rs.getString("timestamp");
+
+                    int studentNum = rs.getInt("student_number");
+                    Integer sn = rs.wasNull() ? null : studentNum;
+
+                    String name = rs.getString("name");
+                    String email = rs.getString("email");
+                    String option = rs.getString("optionCode");
+                    boolean correct = rs.getInt("isCorrectAnswer") == 1;
+
+                    list.add(new AnswerResultRow(ts, sn, name, email, option, correct));
                 }
             }
         }

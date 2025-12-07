@@ -755,6 +755,15 @@ public class Server {
                     }
                 }
 
+                case "VIEW_RESULTS" -> {
+                    try {
+                        handleViewResults(user, in, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("VIEW_RESULTS_ERROR"));
+                    }
+                }
+
                 default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
             }
         }
@@ -1012,6 +1021,107 @@ public class Server {
 
             } finally {
                 conn.setAutoCommit(oldAutoCommit);
+            }
+        }
+    }
+
+    private void handleViewResults(User user, BufferedReader in, PrintWriter out) throws IOException {
+        // 1) Only teachers
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        // 2) Ask for access code
+        out.println("PROMPT Access code of question:");
+        String accessCode = in.readLine();
+        if (accessCode == null || accessCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
+            return;
+        }
+        accessCode = accessCode.trim();
+
+        synchronized (dbLock) {
+            try {
+                // 3) Load question by access code
+                DatabaseManager.QuestionDTO q = dbManager.findQuestionByAccessCode(accessCode);
+                if (q == null) {
+                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                    return;
+                }
+
+                // 4) Ensure this teacher owns the question
+                if (q.teacherId() != user.id()) {
+                    out.println(ClientServerProtocol.buildError("NOT_YOUR_QUESTION"));
+                    return;
+                }
+
+                // 5) Ensure the question is expired
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
+                if (now.isBefore(end)) {
+                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_EXPIRED"));
+                    return;
+                }
+
+                // 6) Load options and answers
+                java.util.List<DatabaseManager.OptionDTO> opts =
+                        dbManager.findOptionsForQuestion(q.id());
+
+                java.util.List<DatabaseManager.AnswerResultRow> answers =
+                        dbManager.findAnswersForQuestion(q.id());
+
+                // 7) Build the report text
+                StringBuilder sb = new StringBuilder();
+
+                sb.append("Results for question ").append(q.accessCode()).append("\n");
+                sb.append("Statement: ").append(q.statement()).append("\n");
+                sb.append("Start: ").append(q.startTime()).append("\n");
+                sb.append("End: ").append(q.endTime()).append("\n");
+                sb.append("\nOptions:\n");
+
+                for (DatabaseManager.OptionDTO o : opts) {
+                    sb.append("  ").append(o.code()).append(") ").append(o.text());
+                    if (o.isCorrect()) {
+                        sb.append("  [CORRECT]");
+                    }
+                    sb.append("\n");
+                }
+
+                sb.append("\nSubmitted answers:\n");
+                if (answers.isEmpty()) {
+                    sb.append("  (no answers submitted)\n");
+                } else {
+                    for (DatabaseManager.AnswerResultRow row : answers) {
+                        sb.append("  [").append(row.timestamp()).append("] ");
+
+                        if (row.studentNumber() != null) {
+                            sb.append("#").append(row.studentNumber()).append(" ");
+                        }
+
+                        sb.append(row.studentName())
+                                .append(" <").append(row.studentEmail()).append(">")
+                                .append(" -> ").append(row.optionCode());
+
+                        if (row.correct()) {
+                            sb.append(" (CORRECT)");
+                        } else {
+                            sb.append(" (WRONG)");
+                        }
+                        sb.append("\n");
+                    }
+                }
+
+                // 8) Encode as BLOCK (multi-line response)
+                String payload = sb.toString()
+                        .replace("\r", "")
+                        .replace("\n", "\\n");
+
+                out.println("BLOCK " + payload);
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("VIEW_RESULTS_DB_ERROR"));
             }
         }
     }
