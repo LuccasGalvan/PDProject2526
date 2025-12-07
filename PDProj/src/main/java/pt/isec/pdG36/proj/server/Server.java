@@ -705,7 +705,6 @@ public class Server {
                     return; // exit the loop and close connection
                 }
 
-                // future commands
                 case "CREATE_QUESTION" -> {
                     try {
                         handleCreateQuestion(user, in, out);
@@ -1025,6 +1024,7 @@ public class Server {
         }
     }
 
+    //will show results of a specific question
     private void handleViewResults(User user, BufferedReader in, PrintWriter out) throws IOException {
         // 1) Only teachers
         if (!"TEACHER".equalsIgnoreCase(user.role())) {
@@ -1112,12 +1112,12 @@ public class Server {
                     }
                 }
 
-                // 8) Encode as BLOCK (multi-line response)
+                // 8) Encode as RESULT_BLOCK
                 String payload = sb.toString()
                         .replace("\r", "")
                         .replace("\n", "\\n");
 
-                out.println("BLOCK " + payload);
+                out.println("RESULT_BLOCK " + payload);
 
             } catch (SQLException e) {
                 e.printStackTrace();
@@ -1143,19 +1143,23 @@ public class Server {
             out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
             return;
         }
+        accessCode = accessCode.trim();
 
+        // Variáveis locais para ler do DB dentro do lock e depois liberar
+        long questionId;
+        String statement;
+        java.time.LocalDateTime start;
+        java.time.LocalDateTime end;
+        java.util.List<String[]> options = new java.util.ArrayList<>(); // [code, text]
+
+        // Ler tudo do BD dentro do lock
         synchronized (dbLock) {
             try {
                 Connection conn = dbManager.getConnection();
 
-                long questionId;
-                String statement;
-                String startStr;
-                String endStr;
-
                 try (PreparedStatement ps = conn.prepareStatement(
                         "SELECT id, statement, startTime, endTime FROM questions WHERE accessCode = ?")) {
-                    ps.setString(1, accessCode.trim());
+                    ps.setString(1, accessCode);
                     try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
@@ -1163,14 +1167,12 @@ public class Server {
                         }
                         questionId = rs.getLong("id");
                         statement = rs.getString("statement");
-                        startStr = rs.getString("startTime");
-                        endStr = rs.getString("endTime");
+                        start = java.time.LocalDateTime.parse(rs.getString("startTime"));
+                        end = java.time.LocalDateTime.parse(rs.getString("endTime"));
                     }
                 }
 
                 java.time.LocalDateTime now = java.time.LocalDateTime.now();
-                java.time.LocalDateTime start = java.time.LocalDateTime.parse(startStr);
-                java.time.LocalDateTime end = java.time.LocalDateTime.parse(endStr);
                 if (now.isBefore(start) || now.isAfter(end)) {
                     out.println(ClientServerProtocol.buildError("QUESTION_NOT_ACTIVE"));
                     return;
@@ -1188,38 +1190,46 @@ public class Server {
                     }
                 }
 
-                // \* construir a pergunta inteira numa string só \*
-                StringBuilder sb = new StringBuilder();
-                sb.append("Question: ").append(statement).append("\n");
-                sb.append("Options:").append("\n");
-
                 try (PreparedStatement ps = conn.prepareStatement(
                         "SELECT code, text FROM options WHERE questionId = ? ORDER BY code")) {
                     ps.setLong(1, questionId);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
-                            String code = rs.getString("code");
-                            String text = rs.getString("text");
-                            sb.append(code).append(") ").append(text).append("\n");
+                            options.add(new String[]{ rs.getString("code"), rs.getString("text") });
                         }
                     }
                 }
 
-                // build full question text
-                String questionText = sb.toString().replace("\r", "");
+            } catch (SQLException e) {
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
+                return;
+            }
+        } // fim do synchronized - lock liberado aqui
 
-                // encode internal newlines as literal "\n"
-                questionText = questionText.replace("\n", "\\n");
+        // Construir e enviar QUESTION_BLOCK fora do lock
+        StringBuilder sb = new StringBuilder();
+        sb.append("Question: ").append(statement).append("\n");
+        sb.append("Options:").append("\n");
+        for (String[] opt : options) {
+            sb.append(opt[0]).append(") ").append(opt[1]).append("\n");
+        }
+        String questionText = sb.toString().replace("\r", "").replace("\n", "\\n");
+        out.println("QUESTION_BLOCK " + questionText);
 
-                // send as a single logical line
-                out.println("QUESTION_BLOCK " + questionText);
+        // Ler a resposta do cliente sem segurar o lock
+        String optionCode = in.readLine();
+        if (optionCode == null || optionCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
+            out.println("QUESTION_ABORTED");
+            return;
+        }
+        optionCode = optionCode.trim();
 
-                String optionCode = in.readLine();
-                if (optionCode == null || optionCode.isBlank()) {
-                    out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
-                    return;
-                }
-                optionCode = optionCode.trim();
+        // Reentrar no lock apenas para validar e gravar
+        synchronized (dbLock) {
+            try {
+                Connection conn = dbManager.getConnection();
 
                 try (PreparedStatement ps = conn.prepareStatement(
                         "SELECT COUNT(*) FROM options WHERE questionId = ? AND code = ?")) {
@@ -1228,6 +1238,7 @@ public class Server {
                     try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next() || rs.getInt(1) == 0) {
                             out.println(ClientServerProtocol.buildError("INVALID_OPTION_CODE"));
+                            out.println("QUESTION_ABORTED");
                             return;
                         }
                     }
@@ -1246,7 +1257,6 @@ public class Server {
 
                 try {
                     long newVersion = Server.this.bumpDbVersion();
-                    // Only the PRIMARY broadcasts SQL updates
                     if (isPrimary) {
                         String sqlForReplication =
                                 "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES ("
@@ -1258,7 +1268,6 @@ public class Server {
                                         + "','"
                                         + escapeSqlLiteral(timestamp)
                                         + "')";
-
                         sendSqlHeartbeatToSecondaries(sqlForReplication);
                     }
                 } catch (SQLException e) {
@@ -1269,10 +1278,10 @@ public class Server {
                 }
 
                 out.println("ANSWER_OK");
-
             } catch (SQLException e) {
                 e.printStackTrace();
                 out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
+                out.println("QUESTION_ABORTED");
             }
         }
     }
@@ -1330,24 +1339,13 @@ public class Server {
                                 }
                             }
                         }
-                        case "EDIT_PROFILE" -> {continue;} // to be implemented - edit profile of logged-in user (name, email, password)
 
                         //student stuff
                         case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
-                        case "LIST_MY_ANSWERS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN")); // to be implemented - list questions answered by the logged-in student (shows questions, options, and whether the answer was correct)
 
-                        //TODO: I think all of this is not necessary?
                         //teacher stuff
                         case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
-                        case "LIST_MY_QUESTIONS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN"));
-                        case "VIEW_RESULTS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN"));
-                        case "EXPORT_RESULTS" -> {continue;} // to be implemented - export results of a specific question created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
-                        case "EXPORT_ALL_RESULTS" -> {continue;} // to be implemented - export results of all questions created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
-                        default -> {
-                            // When not authenticated, only LOGIN and REGISTER_* are allowed.
-                            // Any other command should be rejected.
-                            out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN_OR_UNKNOWN_CMD"));
-                        }
+                        default -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN_OR_UNKNOWN_CMD"));
                     }
                 }
 

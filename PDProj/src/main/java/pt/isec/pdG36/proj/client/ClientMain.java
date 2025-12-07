@@ -9,6 +9,7 @@ import java.net.InetAddress;
 import static java.lang.Thread.sleep;
 
 public class ClientMain {
+    static String assignedRole;
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
@@ -46,9 +47,10 @@ public class ClientMain {
 
             switch (option) {
                 case "1" -> {
-                    if (doLogin(conn, keyboard)) {
+                    String role = doLogin(conn, keyboard);
+                    if (role != null) {
                         // sessão autenticada nesta ligação
-                        postLoginLoop(conn, keyboard);
+                        postLoginLoop(conn, keyboard, role);
                     }
                     // depois da sessão (ou tentativa), fecha esta ligação
                     conn.close();
@@ -73,7 +75,7 @@ public class ClientMain {
         }
     }
 
-    private static boolean doLogin(ClientConnection conn, BufferedReader keyboard) throws Exception {
+    private static String doLogin(ClientConnection conn, BufferedReader keyboard) throws Exception {
         System.out.println();
         System.out.println("== Login ==");
         System.out.print("Email: ");
@@ -89,22 +91,23 @@ public class ClientMain {
             System.out.println("[CLIENT] Raw login response: " + respLine); // DEBUG
         } catch (Exception e) {
             System.err.println("[CLIENT] Error reading login response: " + e.getMessage());
-            return false;
+            return null;
         }
 
         ClientServerProtocol.LoginResponse lr = ClientServerProtocol.parseLoginResponse(respLine);
         if (lr == null) {
             System.err.println("[CLIENT] Invalid response from server: " + respLine);
-            return false;
+            return null;
         }
 
         if (!lr.success()) {
             System.err.println("[CLIENT] Login failed: " + lr.message());
-            return false;
+            return null;
         }
 
         System.out.println("[CLIENT] Login successful. Role: " + lr.role() + " | " + lr.message());
-        return true;
+        return (lr.role() != null) ? lr.role().trim() : null;
+
     }
 
     private static boolean containsPipe(String... vals) {
@@ -192,20 +195,64 @@ public class ClientMain {
         }
     }
 
-    private static void postLoginLoop(ClientConnection conn, BufferedReader keyboard) throws Exception {
+    private static void postLoginLoop(ClientConnection conn, BufferedReader keyboard, String role) throws Exception {
+        boolean isTeacher = "TEACHER".equalsIgnoreCase(role);
         System.out.println();
         System.out.println("You are now logged in. Type commands (or 'logout' to return to menu):");
 
         String line;
-        while ((line = keyboard.readLine()) != null) {
-            if ("logout".equalsIgnoreCase(line)) {
-                System.out.println("[CLIENT] Logging out...");
+        while (true) {
+            // print role-specific menu
+            System.out.println();
+            System.out.println("=== Menu (" + (isTeacher ? "Teacher" : "Student") + ") ===");
+            if (isTeacher) {
+                System.out.println("1) Create question");
+                System.out.println("2) List my questions");
+                System.out.println("3) View results");
+                System.out.println("4) Logout");
+            } else {
+                System.out.println("1) Answer question");
+                System.out.println("2) List my answers");
+                System.out.println("3) Logout");
+            }
+            System.out.print("Option or command: ");
+
+            line = keyboard.readLine();
+            if (line == null) {
+                System.out.println("[CLIENT] Input closed.");
                 conn.sendLine("LOGOUT");
                 return;
             }
+            line = line.trim();
+            if (line.isEmpty()) continue;
 
-            // send the command typed by the user
-            conn.sendLine(line);
+            // map numeric choices to actual commands
+            String toSend = line;
+            if (isTeacher) {
+                switch (line) {
+                    case "1" -> toSend = "CREATE_QUESTION";
+                    case "2" -> toSend = "LIST_MY_QUESTIONS";
+                    case "3" -> toSend = "VIEW_RESULTS";
+                    case "4" -> {
+                        System.out.println("[CLIENT] Logging out...");
+                        conn.sendLine("LOGOUT");
+                        return;
+                    }
+                }
+            } else {
+                switch (line) {
+                    case "1" -> toSend = "ANSWER_QUESTION";
+                    case "2" -> toSend = "LIST_MY_ANSWERS";
+                    case "3" -> {
+                        System.out.println("[CLIENT] Logging out...");
+                        conn.sendLine("LOGOUT");
+                        return;
+                    }
+                }
+            }
+
+            // send the command typed by the user (or mapped numeric)
+            conn.sendLine(toSend);
 
             try {
                 String serverResp = conn.safeReadLine();
@@ -222,13 +269,18 @@ public class ClientMain {
                     continue;
                 }
 
+                if (trimmed.startsWith("RESULT_BLOCK ")) {
+                    handleResultBlock(serverResp);
+                    continue;
+                }
+
                 // 1.5) generic BLOCK (multi-line info, no extra input)
                 if (trimmed.startsWith("BLOCK ")) {
                     String payload = trimmed.substring("BLOCK ".length());
                     payload = payload.replace("\\n", "\n");
 
-                    String[] lines = payload.split("\n");
-                    for (String l : lines) {
+                    String[] linesOut = payload.split("\n");
+                    for (String l : linesOut) {
                         if (!l.isEmpty()) {
                             System.out.println(l);
                         }
@@ -258,6 +310,11 @@ public class ClientMain {
                             break; // done with this prompt flow
                         }
 
+                        if (t.startsWith("RESULT_BLOCK ")) {
+                            handleResultBlock(resp);
+                            break; // done with this prompt flow
+                        }
+
                         System.out.println("SERVER: " + resp);
 
                         // stay in this inner-loop only while server keeps prompting
@@ -270,6 +327,21 @@ public class ClientMain {
             } catch (Exception e) {
                 System.err.println("[CLIENT] Error reading from server: " + e.getMessage());
                 return;
+            }
+        }
+    }
+
+    private static void handleResultBlock(String serverResp) {
+        String trimmed = serverResp.trim();
+        String payload = trimmed.substring("RESULT_BLOCK ".length());
+
+        // decode "\n" back to real newlines
+        payload = payload.replace("\\n", "\n");
+
+        String[] lines = payload.split("\n");
+        for (String l : lines) {
+            if (!l.isEmpty()) {
+                System.out.println(l);
             }
         }
     }
