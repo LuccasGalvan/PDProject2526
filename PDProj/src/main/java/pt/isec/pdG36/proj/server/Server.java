@@ -1336,10 +1336,11 @@ public class Server {
                         case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
                         case "LIST_MY_ANSWERS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN")); // to be implemented - list questions answered by the logged-in student (shows questions, options, and whether the answer was correct)
 
+                        //TODO: I think all of this is not necessary?
                         //teacher stuff
                         case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
                         case "LIST_MY_QUESTIONS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN"));
-                        case "VIEW_RESULTS" -> {continue;} // to be implemented - view results of a specific question created by the logged-in teacher (shows options, % of correct answers, and info of all students who answered the question)
+                        case "VIEW_RESULTS" -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN"));
                         case "EXPORT_RESULTS" -> {continue;} // to be implemented - export results of a specific question created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
                         case "EXPORT_ALL_RESULTS" -> {continue;} // to be implemented - export results of all questions created by the logged-in teacher to a CSV file (server saves the file and provides the path to the teacher)
                         default -> {
