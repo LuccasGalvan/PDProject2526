@@ -63,7 +63,7 @@ public class Server {
 
         // DB initialization / sync (skeleton)
         if (isPrimary) {
-            initOrLoadLocalDbAsPrimary();
+            initOrLoadLocalDb();
         } else {
             obtainDbFromPrimary();
         }
@@ -72,10 +72,9 @@ public class Server {
         startClientAcceptor();
         startDbCopyAcceptor();
         startHeartbeatSender(clientPort, dbPort);
-        startHeartbeatMulticastListener(); // to be used for sync checks later
+        startHeartbeatMulticastListener();
 
-        // For now: block main thread forever
-        // In real code, handle shutdown etc.
+        //TODO: shutdown server option maybe?
     }
 
     private boolean registerWithDirectory(int clientPort, int dbPort) {
@@ -150,7 +149,7 @@ public class Server {
         return newest;
     }
 
-    private void initOrLoadLocalDb(boolean asPrimary) {
+    private void initOrLoadLocalDb() {
         try {
             File dbFile = chooseOrCreateDbFileForPrimary();
 
@@ -168,10 +167,6 @@ public class Server {
             System.err.println("[SERVER] Error initializing DB as PRIMARY: " + e.getMessage());
             e.printStackTrace();
         }
-    }
-
-    private void initOrLoadLocalDbAsPrimary() {
-        initOrLoadLocalDb(true);
     }
 
     private void obtainDbFromPrimary() {
@@ -324,20 +319,19 @@ public class Server {
                             this.primaryDbPort = newPrimaryDbPort;
 
                             boolean samePort = (primaryDbPort == dbPort);
-                            boolean sameHost = true; // single-host assumptions for the project
+                            boolean sameHost = true;
 
                             this.isPrimary = samePort && sameHost;
 
                             if (!oldIsPrimary && this.isPrimary) {
                                 System.out.println("[SERVER] PROMOTED to PRIMARY by directory heartbeat");
-                            } else if (oldIsPrimary && !this.isPrimary) {
-                                System.out.println("[SERVER] DEMOTED from PRIMARY by directory heartbeat");
                             }
                         } else {
                             System.err.println("[SERVER] Unexpected reply to HEARTBEAT: " + reply);
                         }
                     } catch (SocketTimeoutException ignored) {
                         // directory didn’t answer this heartbeat -> ignore, try next time
+
                     }
 
                     // 2) send heartbeat (without SQL) to multicast group for liveness/consistency checking
@@ -398,7 +392,7 @@ public class Server {
                         continue;
                     }
 
-                    // SECONDARY: only care about OUR primary
+                    // SECONDARY: only care about primary
                     if (!senderAddr.equals(primaryDbAddr) || hb.dbPort() != primaryDbPort) {
                         continue;
                     }
@@ -424,7 +418,7 @@ public class Server {
                             + " localVersion=" + localVersion
                             + " sql=" + sql);
 
-                    // strict rule: must be exactly local+1
+                    // dbVersion check
                     if (remoteVersion != localVersion + 1) {
                         System.err.println("[SERVER] DB VERSION MISMATCH on SQL update: "
                                 + "remoteVersion=" + remoteVersion
@@ -474,29 +468,6 @@ public class Server {
             System.err.println("[SERVER] Failed to send SQL HEARTBEAT: " + e.getMessage());
         }
     }
-
-    /*
-    private void sendDbFileToSecondaries() {
-        if (!isPrimary) {
-            return;
-        }
-
-        try (DatagramSocket udp = new DatagramSocket()) {
-            InetAddress mcastAddr = InetAddress.getByName(MCAST_ADDR);
-
-            int clientPort = clientServerSocket.getLocalPort();
-            int dbPort = dbServerSocket.getLocalPort();
-            long version = this.dbVersion; // already bumped
-
-            String dbFilePath = dbManager.getDbPath();
-
-            String msg = DirectoryProtocol.buildDbFileHeartbeat(clientPort, dbPort, version, dbFilePath);
-
-        }catch(IOException e){
-            System.err.println("[SERVER] Failed to send DB file to secondaries: " + e.getMessage());
-        }
-    }
-    */
 
     private User handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
         // Expected: parts[0] = "LOGIN", parts[1] = email, parts[2] = password
@@ -698,6 +669,7 @@ public class Server {
 
             switch (cmd) {
 
+                //common
                 case "PING" -> out.println("PONG");
 
                 case "LOGOUT" -> {
@@ -705,6 +677,16 @@ public class Server {
                     return; // exit the loop and close connection
                 }
 
+                case "EDIT_PROFILE" -> {
+                    try {
+                        handleEditProfile(user, in, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("EDIT_PROFILE_ERROR"));
+                    }
+                }
+
+                //teacher stuff
                 case "CREATE_QUESTION" -> {
                     try {
                         handleCreateQuestion(user, in, out);
@@ -713,6 +695,48 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("CREATE_QUESTION_ERROR"));
                     }
                 }
+
+                case "LIST_MY_QUESTIONS" -> {
+                    if (!"TEACHER".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("ONLY_TEACHERS_CAN_LIST_QUESTIONS"));
+                    } else {
+                        try {
+                            handleListMyQuestions(user, parts, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("LIST_MY_QUESTIONS_ERROR"));
+                        }
+                    }
+                }
+
+                case "VIEW_RESULTS" -> {
+                    try {
+                        handleViewResults(user, in, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("VIEW_RESULTS_ERROR"));
+                    }
+                }
+
+                case "EXPORT_RESULTS" -> {
+                    try {
+                        handleExportResults(user, in, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_ERROR"));
+                    }
+                }
+
+                case "EXPORT_ALL_RESULTS" -> {
+                    try {
+                        handleExportAllResults(user, out);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_ERROR"));
+                    }
+                }
+
+                //student stuff
 
                 case "ANSWER_QUESTION" -> {
                     // only students can answer questions
@@ -740,30 +764,117 @@ public class Server {
                         }
                     }
                 }
-
-                case "LIST_MY_QUESTIONS" -> {
-                    if (!"TEACHER".equalsIgnoreCase(user.role())) {
-                        out.println(ClientServerProtocol.buildError("ONLY_TEACHERS_CAN_LIST_QUESTIONS"));
-                    } else {
-                        try {
-                            handleListMyQuestions(user, parts, out);
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                            out.println(ClientServerProtocol.buildError("LIST_MY_QUESTIONS_ERROR"));
-                        }
-                    }
-                }
-
-                case "VIEW_RESULTS" -> {
-                    try {
-                        handleViewResults(user, in, out);
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                        out.println(ClientServerProtocol.buildError("VIEW_RESULTS_ERROR"));
-                    }
-                }
-
                 default -> out.println(ClientServerProtocol.buildError("UNKNOWN_COMMAND"));
+            }
+        }
+    }
+
+    private void handleEditProfile(User user, BufferedReader in, PrintWriter out) throws IOException {
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
+        // Ask for new values; blank = keep current
+        out.println("PROMPT New name (leave blank to keep current: " + user.name() + "):");
+        String newName = in.readLine();
+        if (newName == null) {
+            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
+            return;
+        }
+        newName = newName.trim();
+
+        out.println("PROMPT New email (leave blank to keep current):");
+        String newEmail = in.readLine();
+        if (newEmail == null) {
+            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
+            return;
+        }
+        newEmail = newEmail.trim();
+
+        out.println("PROMPT New password (leave blank to keep current):");
+        String newPassword = in.readLine();
+        if (newPassword == null) {
+            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
+            return;
+        }
+        newPassword = newPassword.trim();
+
+        // avoid '|' which breaks our protocol
+        if ((newName != null && newName.contains("|"))
+                || (newEmail != null && newEmail.contains("|"))
+                || (newPassword != null && newPassword.contains("|"))) {
+            out.println(ClientServerProtocol.buildError("Fields cannot contain the '|' character"));
+            return;
+        }
+
+        synchronized (dbLock) {
+            Connection conn = null;
+            String finalName = null;
+            String finalEmail = null;
+            String finalHash = null;
+
+            try {
+                conn = dbManager.getConnection();
+
+                // 1) load current values
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT name, email, password_hash FROM users WHERE id = ?")) {
+                    ps.setLong(1, user.id());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            out.println(ClientServerProtocol.buildError("USER_NOT_FOUND"));
+                            return;
+                        }
+                        String currentName = rs.getString("name");
+                        String currentEmail = rs.getString("email");
+                        String currentHash = rs.getString("password_hash");
+
+                        finalName = (newName == null || newName.isBlank()) ? currentName : newName;
+                        finalEmail = (newEmail == null || newEmail.isBlank()) ? currentEmail : newEmail;
+                        finalHash = (newPassword == null || newPassword.isBlank())
+                                ? currentHash
+                                : PassUtil.hashPassword(newPassword);
+                    }
+                }
+
+                // 2) apply update (only name, email, password_hash)
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ?")) {
+                    ps.setString(1, finalName);
+                    ps.setString(2, finalEmail);
+                    ps.setString(3, finalHash);
+                    ps.setLong(4, user.id());
+                    ps.executeUpdate();
+                }
+
+                // 3) bump version and replicate UPDATE to secondaries
+                try {
+                    long newVersion = bumpDbVersion();
+                    if (isPrimary) {
+                        String sql = "UPDATE users SET "
+                                + "name='" + escapeSqlLiteral(finalName) + "', "
+                                + "email='" + escapeSqlLiteral(finalEmail) + "', "
+                                + "password_hash='" + escapeSqlLiteral(finalHash) + "' "
+                                + "WHERE id=" + user.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                    out.println(ClientServerProtocol.buildError("EDIT_PROFILE_VERSION_ERROR"));
+                    return;
+                }
+
+                out.println("BLOCK Profile updated successfully.");
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+                String msg = e.getMessage();
+                if (msg != null && (msg.contains("email") || msg.contains("users.email"))) {
+                    out.println(ClientServerProtocol.buildError("EMAIL_IN_USE"));
+                } else {
+                    out.println(ClientServerProtocol.buildError("EDIT_PROFILE_DB_ERROR"));
+                }
             }
         }
     }
@@ -804,7 +915,6 @@ public class Server {
                 }
             }
 
-            // encode as BLOCK
             String payload = sb.toString().replace("\r", "").replace("\n", "\\n");
             out.println("BLOCK " + payload);
         }
@@ -1126,6 +1236,152 @@ public class Server {
         }
     }
 
+    private void handleExportResults(User user, BufferedReader in, PrintWriter out) throws IOException {
+        // only teachers
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        // ask access code
+        out.println("PROMPT Access code of question to export:");
+        String accessCode = in.readLine();
+        if (accessCode == null || accessCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
+            return;
+        }
+        accessCode = accessCode.trim();
+
+        DatabaseManager.QuestionDTO q;
+        java.util.List<DatabaseManager.OptionDTO> opts;
+        java.util.List<DatabaseManager.AnswerResultRow> answers;
+
+        // read from DB under lock
+        synchronized (dbLock) {
+            try {
+                q = dbManager.findQuestionByAccessCode(accessCode);
+                if (q == null) {
+                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                    return;
+                }
+
+                // must belong to this teacher
+                if (q.teacherId() != user.id()) {
+                    out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
+                    return;
+                }
+
+                // only closed questions can be exported
+                java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                if (!now.isAfter(end)) {
+                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_CLOSED"));
+                    return;
+                }
+
+                opts = dbManager.findOptionsForQuestion(q.id());
+                answers = dbManager.findAnswersForQuestion(q.id());
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_DB_ERROR"));
+                return;
+            }
+        }
+
+        File exportDir = getGlobalExportsDir();
+
+        String safeCode = accessCode.replaceAll("[^a-zA-Z0-9_-]", "_");
+        File csvFile = new File(
+                exportDir,
+                "question-" + q.id() + "-" + safeCode + "-" + System.currentTimeMillis() + ".csv"
+        );
+
+        try (PrintWriter pw = new PrintWriter(csvFile)) {
+            writeQuestionResultsToCsv(pw, q, opts, answers);
+        } catch (IOException e) {
+            e.printStackTrace();
+            out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_IO_ERROR"));
+            return;
+        }
+
+        out.println("EXPORT_OK " + csvFile.getAbsolutePath());
+    }
+
+    private void handleExportAllResults(User user, PrintWriter out) {
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        java.util.List<QuestionExportData> toExport = new java.util.ArrayList<>();
+
+        // load all closed questions + their data under lock
+        synchronized (dbLock) {
+            try {
+                java.util.List<DatabaseManager.QuestionDTO> questions =
+                        dbManager.findQuestionsByTeacher(user.id());
+
+                for (DatabaseManager.QuestionDTO q : questions) {
+                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
+                    if (!now.isAfter(end)) {
+                        // not closed yet
+                        continue;
+                    }
+
+                    java.util.List<DatabaseManager.OptionDTO> opts =
+                            dbManager.findOptionsForQuestion(q.id());
+                    java.util.List<DatabaseManager.AnswerResultRow> answers =
+                            dbManager.findAnswersForQuestion(q.id());
+
+                    toExport.add(new QuestionExportData(q, opts, answers));
+                }
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_DB_ERROR"));
+                return;
+            }
+        }
+
+        if (toExport.isEmpty()) {
+            out.println(ClientServerProtocol.buildError("NO_CLOSED_QUESTIONS_TO_EXPORT"));
+            return;
+        }
+
+        File exportDir = getGlobalExportsDir();
+
+        File csvFile = new File(
+                exportDir,
+                "all-questions-teacher-" + user.email() + "-" + System.currentTimeMillis() + ".csv"
+        );
+
+        try (PrintWriter pw = new PrintWriter(csvFile)) {
+            boolean first = true;
+            for (QuestionExportData qd : toExport) {
+                if (!first) {
+                    pw.println();
+                    pw.println();
+                }
+                first = false;
+
+                writeQuestionResultsToCsv(
+                        pw,
+                        qd.question(),
+                        qd.options(),
+                        qd.answers()
+                );
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+            out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_IO_ERROR"));
+            return;
+        }
+
+        out.println("EXPORT_OK " + csvFile.getAbsolutePath());
+    }
+
     private void handleAnswerQuestion(User user, BufferedReader in, PrintWriter out) throws IOException {
         if (!isPrimary) {
             out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
@@ -1361,6 +1617,74 @@ public class Server {
     private static String escapeSqlLiteral(String value) {
         if (value == null) return "";
         return value.replace("'", "''");
+    }
+
+    // Helper to encode a value as a CSV field (always quoted)
+    private static String toCsvField(String value) {
+        if (value == null)
+            return "\"\"";
+        String v = value.replace("\"", "\"\""); // escape double-quotes
+        return "\"" + v + "\"";
+    }
+
+    // Small record to hold all info for a question export
+    private record QuestionExportData(
+            DatabaseManager.QuestionDTO question,
+            java.util.List<DatabaseManager.OptionDTO> options,
+            java.util.List<DatabaseManager.AnswerResultRow> answers
+    ) {}
+
+    // Writes ONE question (metadata + options + answers) in CSV format to pw
+    private void writeQuestionResultsToCsv(
+            PrintWriter pw,
+            DatabaseManager.QuestionDTO q,
+            java.util.List<DatabaseManager.OptionDTO> opts,
+            java.util.List<DatabaseManager.AnswerResultRow> answers
+    ) {
+        // Question header
+        pw.println("QuestionID,AccessCode,Statement,StartTime,EndTime");
+        pw.println(
+                toCsvField(String.valueOf(q.id())) + "," +
+                        toCsvField(q.accessCode()) + "," +
+                        toCsvField(q.statement()) + "," +
+                        toCsvField(q.startTime()) + "," +
+                        toCsvField(q.endTime())
+        );
+
+        pw.println();
+        pw.println("OptionCode,OptionText,IsCorrect");
+        for (DatabaseManager.OptionDTO o : opts) {
+            pw.println(
+                    toCsvField(o.code()) + "," +
+                            toCsvField(o.text()) + "," +
+                            toCsvField(o.isCorrect() ? "true" : "false")
+            );
+        }
+
+        pw.println();
+        pw.println("Timestamp,StudentNumber,StudentName,StudentEmail,OptionCode,Correct");
+        for (DatabaseManager.AnswerResultRow row : answers) {
+            String studentNumberStr = (row.studentNumber() != null)
+                    ? String.valueOf(row.studentNumber())
+                    : "";
+            pw.println(
+                    toCsvField(row.timestamp()) + "," +
+                            toCsvField(studentNumberStr) + "," +
+                            toCsvField(row.studentName()) + "," +
+                            toCsvField(row.studentEmail()) + "," +
+                            toCsvField(row.optionCode()) + "," +
+                            toCsvField(row.correct() ? "true" : "false")
+            );
+        }
+    }
+
+    private static File getGlobalExportsDir() {
+        File root = new File(System.getProperty("user.dir")); // project root at runtime
+        File exportsDir = new File(root, "exports");
+        if (!exportsDir.exists()) {
+            exportsDir.mkdirs();
+        }
+        return exportsDir;
     }
 
     public static void main(String[] args) throws Exception {

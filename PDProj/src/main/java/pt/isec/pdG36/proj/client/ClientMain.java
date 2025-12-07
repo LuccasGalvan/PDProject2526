@@ -209,11 +209,15 @@ public class ClientMain {
                 System.out.println("1) Create question");
                 System.out.println("2) List my questions");
                 System.out.println("3) View results");
-                System.out.println("4) Logout");
+                System.out.println("4) Export results");
+                System.out.println("5) Export all results");
+                System.out.println("6) Edit profile");
+                System.out.println("7) Logout");
             } else {
                 System.out.println("1) Answer question");
                 System.out.println("2) List my answers");
-                System.out.println("3) Logout");
+                System.out.println("3) Edit profile");
+                System.out.println("4) Logout");
             }
             System.out.print("Option or command: ");
 
@@ -233,7 +237,10 @@ public class ClientMain {
                     case "1" -> toSend = "CREATE_QUESTION";
                     case "2" -> toSend = "LIST_MY_QUESTIONS";
                     case "3" -> toSend = "VIEW_RESULTS";
-                    case "4" -> {
+                    case "4" -> toSend = "EXPORT_RESULTS";
+                    case "5" -> toSend = "EXPORT_ALL_RESULTS";
+                    case "6" -> toSend = "EDIT_PROFILE";
+                    case "7" -> {
                         System.out.println("[CLIENT] Logging out...");
                         conn.sendLine("LOGOUT");
                         return;
@@ -243,7 +250,8 @@ public class ClientMain {
                 switch (line) {
                     case "1" -> toSend = "ANSWER_QUESTION";
                     case "2" -> toSend = "LIST_MY_ANSWERS";
-                    case "3" -> {
+                    case "3" -> toSend = "EDIT_PROFILE";
+                    case "4" -> {
                         System.out.println("[CLIENT] Logging out...");
                         conn.sendLine("LOGOUT");
                         return;
