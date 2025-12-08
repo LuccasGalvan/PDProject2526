@@ -9,8 +9,9 @@ import pt.isec.pdG36.proj.server.db.PassUtil;
 import pt.isec.pdG36.proj.server.db.User;
 import java.sql.Connection;
 import java.sql.SQLException;
-
-import javax.xml.crypto.Data;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.Collections;
 import java.io.*;
 import java.net.*;
 import java.sql.*;
@@ -37,6 +38,9 @@ public class Server {
     private volatile long dbVersion = 0;
 
     private DatabaseManager dbManager;
+
+    private final Set<PrintWriter> studentNotificationSinks =
+            Collections.synchronizedSet(new HashSet<>());
 
     public Server(InetAddress dirAddr, int dirUdpPort, File dbDirectory, InetAddress multicastIface) {
         this.dirAddr = dirAddr;
@@ -73,8 +77,6 @@ public class Server {
         startDbCopyAcceptor();
         startHeartbeatSender(clientPort, dbPort);
         startHeartbeatMulticastListener();
-
-        //TODO: shutdown server option maybe?
     }
 
     private boolean registerWithDirectory(int clientPort, int dbPort) {
@@ -709,6 +711,32 @@ public class Server {
                     }
                 }
 
+                case "EDIT_QUESTION" -> {
+                    if (!"TEACHER".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+                    } else {
+                        try {
+                            handleEditQuestion(user, in, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("EDIT_QUESTION_ERROR"));
+                        }
+                    }
+                }
+
+                case "DELETE_QUESTION" -> {
+                    if (!"TEACHER".equalsIgnoreCase(user.role())) {
+                        out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+                    } else {
+                        try {
+                            handleDeleteQuestion(user, in, out);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            out.println(ClientServerProtocol.buildError("DELETE_QUESTION_ERROR"));
+                        }
+                    }
+                }
+
                 case "VIEW_RESULTS" -> {
                     try {
                         handleViewResults(user, in, out);
@@ -1117,6 +1145,7 @@ public class Server {
                     }
 
                     out.println("CREATE_QUESTION_OK Access code: " + accessCode);
+                    notifyStudents("NEW_QUESTION " + accessCode);
                 } catch (SQLException e) {
                     System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after CREATE_QUESTION: "
                             + e.getMessage());
@@ -1232,6 +1261,280 @@ public class Server {
             } catch (SQLException e) {
                 e.printStackTrace();
                 out.println(ClientServerProtocol.buildError("VIEW_RESULTS_DB_ERROR"));
+            }
+        }
+    }
+
+    private void handleEditQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        // 1) Ask question by access code
+        out.println("PROMPT Access code of question to edit:");
+        String accessCode = in.readLine();
+        if (accessCode == null || accessCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
+            return;
+        }
+        accessCode = accessCode.trim();
+
+        DatabaseManager.QuestionDTO q;
+        int answersCount;
+
+        synchronized (dbLock) {
+            q = dbManager.findQuestionByAccessCode(accessCode);
+            if (q == null) {
+                out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                return;
+            }
+            if (q.teacherId() != user.id()) {
+                out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
+                return;
+            }
+            answersCount = dbManager.countAnswersForQuestion(q.id());
+        }
+
+        if (answersCount > 0) {
+            out.println(ClientServerProtocol.buildError("QUESTION_HAS_ANSWERS_CANNOT_EDIT"));
+            return;
+        }
+
+        // 2) Ask new statement / times / options (similar to CREATE_QUESTION)
+
+        out.println("Enter NEW question statement:");
+        String statement = in.readLine();
+        if (statement == null || statement.isBlank()) {
+            out.println(ClientServerProtocol.buildError("EMPTY_STATEMENT"));
+            return;
+        }
+
+        out.println("Enter NEW start time (e.g., 2025-01-01T10:00):");
+        String startTime = in.readLine();
+        out.println("Enter NEW end time (e.g., 2025-01-01T10:10):");
+        String endTime = in.readLine();
+
+        int numOptions = 0;
+        while (true) {
+            out.println("Enter number of options (2..5):");
+            String s = in.readLine();
+            if (s == null) {
+                out.println(ClientServerProtocol.buildError("CANCELLED"));
+                return;
+            }
+            try {
+                numOptions = Integer.parseInt(s.trim());
+                if (numOptions < 2 || numOptions > 5) {
+                    out.println(ClientServerProtocol.buildError("INVALID_NUM_OPTIONS"));
+                } else {
+                    break;
+                }
+            } catch (NumberFormatException e) {
+                out.println(ClientServerProtocol.buildError("INVALID_NUM_OPTIONS"));
+            }
+        }
+
+        String[] codes = new String[numOptions];
+        String[] texts = new String[numOptions];
+        boolean[] correctFlags = new boolean[numOptions];
+
+        boolean hasCorrect = false;
+
+        for (int i = 0; i < numOptions; i++) {
+            String code = String.valueOf((char)('A' + i));
+            out.println("Option " + code + " text:");
+            String txt = in.readLine();
+            if (txt == null || txt.isBlank()) {
+                out.println(ClientServerProtocol.buildError("EMPTY_OPTION_TEXT"));
+                return;
+            }
+
+            out.println("Is this a correct option? (yes/no):");
+            String ans = in.readLine();
+            boolean isCorrect = ans != null && ans.trim().equalsIgnoreCase("yes");
+
+            codes[i] = code;
+            texts[i] = txt;
+            correctFlags[i] = isCorrect;
+            if (isCorrect) hasCorrect = true;
+        }
+
+        if (!hasCorrect) {
+            out.println(ClientServerProtocol.buildError("NO_CORRECT_OPTION"));
+            return;
+        }
+
+        // 3) Apply changes in DB + replicate UPDATE & options changes
+
+        synchronized (dbLock) {
+            Connection conn = dbManager.getConnection();
+            boolean oldAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // Update question core fields (statement + times)
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE questions SET statement = ?, startTime = ?, endTime = ? WHERE id = ?")) {
+                    ps.setString(1, statement);
+                    ps.setString(2, startTime);
+                    ps.setString(3, endTime);
+                    ps.setLong(4, q.id());
+                    ps.executeUpdate();
+                }
+
+                // Delete old options
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM options WHERE questionId = ?")) {
+                    ps.setLong(1, q.id());
+                    ps.executeUpdate();
+                }
+
+                // Insert new options
+                for (int i = 0; i < numOptions; i++) {
+                    dbManager.insertOption(q.id(), codes[i], texts[i], correctFlags[i]);
+                }
+
+                conn.commit();
+
+                // Replication: UPDATE question, then delete+reinsert options
+                if (isPrimary) {
+                    {
+                        long newVersion = bumpDbVersion();
+                        String sql = "UPDATE questions SET "
+                                + "statement='" + escapeSqlLiteral(statement) + "', "
+                                + "startTime='" + escapeSqlLiteral(startTime) + "', "
+                                + "endTime='" + escapeSqlLiteral(endTime) + "' "
+                                + "WHERE id=" + q.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+
+                    {
+                        long newVersion = bumpDbVersion();
+                        String sql = "DELETE FROM options WHERE questionId=" + q.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+
+                    for (int i = 0; i < numOptions; i++) {
+                        long newVersion = bumpDbVersion();
+                        String sql = "INSERT INTO options(questionId, code, text, isCorrect) VALUES ("
+                                + q.id() + ","
+                                + "'" + escapeSqlLiteral(codes[i]) + "',"
+                                + "'" + escapeSqlLiteral(texts[i]) + "',"
+                                + (correctFlags[i] ? 1 : 0)
+                                + ")";
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+                }
+
+                out.println("BLOCK Question edited successfully. Access code: " + accessCode);
+
+            } catch (SQLException e) {
+                conn.rollback();
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("EDIT_QUESTION_DB_ERROR"));
+            } finally {
+                conn.setAutoCommit(oldAuto);
+            }
+        }
+    }
+
+    private void handleDeleteQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
+        if (!isPrimary) {
+            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
+            return;
+        }
+
+        if (!"TEACHER".equalsIgnoreCase(user.role())) {
+            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
+            return;
+        }
+
+        out.println("PROMPT Access code of question to delete:");
+        String accessCode = in.readLine();
+        if (accessCode == null || accessCode.isBlank()) {
+            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
+            return;
+        }
+        accessCode = accessCode.trim();
+
+        DatabaseManager.QuestionDTO q;
+        int answersCount;
+
+        synchronized (dbLock) {
+            q = dbManager.findQuestionByAccessCode(accessCode);
+            if (q == null) {
+                out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
+                return;
+            }
+            if (q.teacherId() != user.id()) {
+                out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
+                return;
+            }
+            answersCount = dbManager.countAnswersForQuestion(q.id());
+        }
+
+        if (answersCount > 0) {
+            out.println(ClientServerProtocol.buildError("QUESTION_HAS_ANSWERS_CANNOT_DELETE"));
+            return;
+        }
+
+        synchronized (dbLock) {
+            Connection conn = dbManager.getConnection();
+            boolean oldAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // Since we checked there are no answers, this is mostly defensive
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM answers WHERE questionId = ?")) {
+                    ps.setLong(1, q.id());
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM options WHERE questionId = ?")) {
+                    ps.setLong(1, q.id());
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM questions WHERE id = ?")) {
+                    ps.setLong(1, q.id());
+                    ps.executeUpdate();
+                }
+
+                conn.commit();
+
+                if (isPrimary) {
+                    {
+                        long newVersion = bumpDbVersion();
+                        String sql = "DELETE FROM answers WHERE questionId=" + q.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+                    {
+                        long newVersion = bumpDbVersion();
+                        String sql = "DELETE FROM options WHERE questionId=" + q.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+                    {
+                        long newVersion = bumpDbVersion();
+                        String sql = "DELETE FROM questions WHERE id=" + q.id();
+                        sendSqlHeartbeatToSecondaries(sql);
+                    }
+                }
+
+                out.println("BLOCK Question deleted successfully. Access code: " + accessCode);
+
+            } catch (SQLException e) {
+                conn.rollback();
+                e.printStackTrace();
+                out.println(ClientServerProtocol.buildError("DELETE_QUESTION_DB_ERROR"));
+            } finally {
+                conn.setAutoCommit(oldAuto);
             }
         }
     }
@@ -1581,16 +1884,17 @@ public class Server {
                     switch (cmd) {
                         //common stuff
                         case "LOGIN" -> {
-                            // handleLogin autentica e retorna o User em caso de sucesso.
-                            // Se obtivermos um User, entramos no loop de sessão (postLoginLoop)
                             user = handleLogin(parts, in, out);
                             if (user != null) {
+                                // register for notifications if this is a student
+                                registerStudentNotification(user, out);
                                 try {
                                     postLoginLoop(user, in, out);
                                 } catch (IOException e) {
                                     System.err.println(getName() + " - session IO error: " + e.getMessage());
                                 } finally {
-                                    // sessão terminada (logout ou erro) -> user volta a null (permitir novo login na mesma conexão)
+                                    // remove from notification sinks and allow new login on same socket
+                                    unregisterNotification(out);
                                     user = null;
                                 }
                             }
@@ -1685,6 +1989,29 @@ public class Server {
             exportsDir.mkdirs();
         }
         return exportsDir;
+    }
+
+    private void registerStudentNotification(User user, PrintWriter out) {
+        if (user != null && "STUDENT".equalsIgnoreCase(user.role())) {
+            studentNotificationSinks.add(out);
+        }
+    }
+
+    private void unregisterNotification(PrintWriter out) {
+        studentNotificationSinks.remove(out);
+    }
+
+    private void notifyStudents(String payload) {
+        String line = "NOTIFY " + payload;
+        synchronized (studentNotificationSinks) {
+            for (PrintWriter pw : studentNotificationSinks) {
+                try {
+                    pw.println(line);
+                } catch (Exception ignored) {
+                    // broken clients will be cleaned up on close
+                }
+            }
+        }
     }
 
     public static void main(String[] args) throws Exception {

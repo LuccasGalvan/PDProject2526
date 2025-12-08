@@ -527,6 +527,19 @@ public class DatabaseManager implements AutoCloseable {
             conn.close();
     }
 
+    public int countAnswersForQuestion(long questionId) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM answers WHERE questionId = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, questionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt(1);
+                }
+                return 0;
+            }
+        }
+    }
+
     // getters
     public Connection getConnection() {
         return conn;

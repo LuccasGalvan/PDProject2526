@@ -209,10 +209,12 @@ public class ClientMain {
                 System.out.println("1) Create question");
                 System.out.println("2) List my questions");
                 System.out.println("3) View results");
-                System.out.println("4) Export results");
-                System.out.println("5) Export all results");
-                System.out.println("6) Edit profile");
-                System.out.println("7) Logout");
+                System.out.println("4) Edit a question");
+                System.out.println("5) Delete a question");
+                System.out.println("6) Export results");
+                System.out.println("7) Export all results");
+                System.out.println("8) Edit profile");
+                System.out.println("9) Logout");
             } else {
                 System.out.println("1) Answer question");
                 System.out.println("2) List my answers");
@@ -237,10 +239,12 @@ public class ClientMain {
                     case "1" -> toSend = "CREATE_QUESTION";
                     case "2" -> toSend = "LIST_MY_QUESTIONS";
                     case "3" -> toSend = "VIEW_RESULTS";
-                    case "4" -> toSend = "EXPORT_RESULTS";
-                    case "5" -> toSend = "EXPORT_ALL_RESULTS";
-                    case "6" -> toSend = "EDIT_PROFILE";
-                    case "7" -> {
+                    case "4" -> toSend = "EDIT_QUESTION";
+                    case "5" -> toSend = "DELETE_QUESTION";
+                    case "6" -> toSend = "EXPORT_RESULTS";
+                    case "7" -> toSend = "EXPORT_ALL_RESULTS";
+                    case "8" -> toSend = "EDIT_PROFILE";
+                    case "9" -> {
                         System.out.println("[CLIENT] Logging out...");
                         conn.sendLine("LOGOUT");
                         return;
