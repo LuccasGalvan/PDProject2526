@@ -14,10 +14,6 @@ public final class DirectoryProtocol {
         return "HEARTBEAT " + clientPort + " " + dbPort + " " + dbVersion;
     }
 
-    public static String buildUnregister(int clientPort, int dbPort) {
-        return "UNREGISTER " + clientPort + " " + dbPort;
-    }
-
     public static String buildGetServer() {
         return "GET_SERVER";
     }
@@ -36,18 +32,7 @@ public final class DirectoryProtocol {
 
     public record HeartbeatInfo(int clientPort, int dbPort, long dbVersion) {}
 
-    public static boolean isHeartbeat(String msg) {
-        if (msg == null) return false;
-        String trimmed = msg.trim();
-        return trimmed.startsWith("HEARTBEAT ");
-    }
-
-    /**
-     * Builds a HEARTBEAT that also carries a SQL statement for replication.
-     * Format:
-     *   HEARTBEAT <clientPort> <dbPort> <dbVersion> SQL <sql...>
-     * Directory only cares about the first 4 tokens, so it’s safe.
-     */
+    // Build HEARTBEAT message with embedded SQL
     public static String buildHeartbeatWithSql(int clientPort, int dbPort, long dbVersion, String sql) {
         if (sql == null || sql.isBlank()) {
             throw new IllegalArgumentException("sql must not be null/blank");
@@ -56,10 +41,7 @@ public final class DirectoryProtocol {
         return "HEARTBEAT " + clientPort + " " + dbPort + " " + dbVersion + " SQL " + sanitizedSql;
     }
 
-    /**
-     * Extracts the SQL part from a HEARTBEAT-with-SQL.
-     * Returns null if there is no SQL part.
-     */
+    // Extract SQL from HEARTBEAT message
     public static String extractSqlFromHeartbeat(String msg) {
         if (msg == null) return null;
         int idx = msg.indexOf(" SQL ");
@@ -95,7 +77,6 @@ public final class DirectoryProtocol {
             return null;
         }
         String[] p = msg.trim().split("\\s+");
-        // Expected: HEARTBEAT <clientPort> <dbPort> <dbVersion> [SQL ...]
         if (p.length < 4) {
             return null;
         }

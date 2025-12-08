@@ -5,13 +5,14 @@ package pt.isec.pdG36.proj.server;
 import pt.isec.pdG36.proj.common.protocol.DirectoryProtocol;
 import pt.isec.pdG36.proj.common.protocol.ClientServerProtocol;
 import pt.isec.pdG36.proj.server.db.DatabaseManager;
-import pt.isec.pdG36.proj.server.db.PassUtil;
 import pt.isec.pdG36.proj.server.db.User;
-import java.sql.Connection;
+import pt.isec.pdG36.proj.server.services.NotificationHub;
+import pt.isec.pdG36.proj.server.services.StudentService;
+import pt.isec.pdG36.proj.server.services.TeacherService;
+import pt.isec.pdG36.proj.server.services.UserService;
+import pt.isec.pdG36.proj.server.util.ServerUtil;
+
 import java.sql.SQLException;
-import java.util.Set;
-import java.util.HashSet;
-import java.util.Collections;
 import java.io.*;
 import java.net.*;
 import java.sql.*;
@@ -39,8 +40,10 @@ public class Server {
 
     private DatabaseManager dbManager;
 
-    private final Set<PrintWriter> studentNotificationSinks =
-            Collections.synchronizedSet(new HashSet<>());
+    private UserService userService;
+    private TeacherService teacherService;
+    private StudentService studentService;
+    private NotificationHub notificationHub;
 
     public Server(InetAddress dirAddr, int dirUdpPort, File dbDirectory, InetAddress multicastIface) {
         this.dirAddr = dirAddr;
@@ -50,7 +53,7 @@ public class Server {
     }
 
     public void start() throws Exception {
-        // Create TCP listening sockets on automatic ports
+        //create TCP listening sockets on automatic ports
         clientServerSocket = new ServerSocket(0);
         dbServerSocket = new ServerSocket(0);
 
@@ -59,20 +62,26 @@ public class Server {
 
         System.out.println("Server TCP ports - clients: " + clientPort + ", dbCopy: " + dbPort);
 
-        // Register via UDP
+        //register with directory
         if (!registerWithDirectory(clientPort, dbPort)) {
             System.err.println("Failed to register with directory. Exiting.");
             return;
         }
 
-        // DB initialization / sync (skeleton)
+        //DB initialization / sync
         if (isPrimary) {
             initOrLoadLocalDb();
         } else {
             obtainDbFromPrimary();
         }
 
-        // Start threads
+        //initialize services
+        this.userService = new UserService(dbManager, dbLock, this);
+        this.teacherService = new TeacherService(dbManager, dbLock, this);
+        this.studentService = new StudentService(dbManager, dbLock, this);
+        this.notificationHub = new NotificationHub();
+
+        //start threads
         startClientAcceptor();
         startDbCopyAcceptor();
         startHeartbeatSender(clientPort, dbPort);
@@ -107,7 +116,6 @@ public class Server {
             primaryDbPort = primaryInfo.dbPort();
 
             // check if we are primary:
-            // NOTE: local address matching is tricky in real env; skeleton style:
             boolean samePort = (primaryDbPort == dbPort);
             boolean sameHost = true;
 
@@ -219,7 +227,7 @@ public class Server {
         } catch (IOException | SQLException e) {
             System.err.println("[SERVER] Error obtaining DB from primary: " + e.getMessage());
             e.printStackTrace();
-            System.exit(1); // as per spec, if secondary can't sync it should die
+            System.exit(1); //if secondary can't sync it should die
         }
     }
 
@@ -259,7 +267,7 @@ public class Server {
         try (socket;
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
 
-            // Only primary should serve DB copies
+            //only primary should serve DB copies
             if (!isPrimary) {
                 System.out.println("[SERVER] Ignoring DB copy request on non-primary");
                 return;
@@ -299,7 +307,6 @@ public class Server {
 
                     System.out.println("[SERVER] Sending HEARTBEAT: " + hb);
 
-                    // 1) send to directory and wait for PRIMARY reply
                     DatagramPacket toDir = new DatagramPacket(data, data.length, dirAddr, dirUdpPort);
                     udp.send(toDir);
 
@@ -332,8 +339,7 @@ public class Server {
                             System.err.println("[SERVER] Unexpected reply to HEARTBEAT: " + reply);
                         }
                     } catch (SocketTimeoutException ignored) {
-                        // directory didn’t answer this heartbeat -> ignore, try next time
-
+                        //ignore
                     }
 
                     // 2) send heartbeat (without SQL) to multicast group for liveness/consistency checking
@@ -368,11 +374,6 @@ public class Server {
                         continue;
                     }
 
-                    if (!msg.startsWith("HEARTBEAT")) {
-                        // later we can handle other message types here
-                        continue;
-                    }
-
                     DirectoryProtocol.HeartbeatInfo hb = DirectoryProtocol.parseHeartbeat(msg);
                     if (hb == null) {
                         System.err.println("[SERVER] Invalid multicast HEARTBEAT: " + msg);
@@ -381,7 +382,7 @@ public class Server {
 
                     InetAddress senderAddr = packet.getAddress();
 
-                    // Ignore our own heartbeats
+                    //ignore our own heartbeats
                     boolean sameHost = senderAddr.equals(multicastIface);
                     boolean sameClientPort = hb.clientPort() == clientServerSocket.getLocalPort();
                     boolean sameDbPort = hb.dbPort() == dbServerSocket.getLocalPort();
@@ -389,18 +390,18 @@ public class Server {
                         continue;
                     }
 
-                    // PRIMARY never consumes replication from others
+                    //primary doesnt care
                     if (isPrimary) {
                         continue;
                     }
 
-                    // SECONDARY: only care about primary
+                    //secondary only processes primary heartbeats
                     if (!senderAddr.equals(primaryDbAddr) || hb.dbPort() != primaryDbPort) {
                         continue;
                     }
 
                     long remoteVersion = hb.dbVersion();
-                    long localVersion = this.dbVersion; // volatile
+                    long localVersion = this.dbVersion;
 
                     String sql = DirectoryProtocol.extractSqlFromHeartbeat(msg);
 
@@ -447,7 +448,7 @@ public class Server {
         t.start();
     }
 
-    private void sendSqlHeartbeatToSecondaries(String sql) {
+    public void sendSqlHeartbeatToSecondaries(String sql) {
         if (!isPrimary) {
             return;
         }
@@ -457,7 +458,7 @@ public class Server {
 
             int clientPort = clientServerSocket.getLocalPort();
             int dbPort = dbServerSocket.getLocalPort();
-            long version = this.dbVersion; // already bumped
+            long version = this.dbVersion;
 
             String msg = DirectoryProtocol.buildHeartbeatWithSql(clientPort, dbPort, version, sql);
             byte[] data = msg.getBytes();
@@ -471,199 +472,11 @@ public class Server {
         }
     }
 
-    private User handleLogin(String[] parts, BufferedReader in, PrintWriter out) {
-        // Expected: parts[0] = "LOGIN", parts[1] = email, parts[2] = password
-        if (parts.length < 3) {
-            out.println(ClientServerProtocol.buildLoginFail("Missing credentials"));
-            return null;
-        }
-
-        String email = parts[1];
-        String password = parts[2];
-
-        try {
-            User user = dbManager.authenticate(email, password);
-            if (user == null) {
-                out.println(ClientServerProtocol.buildLoginFail("INVALID_CREDENTIALS"));
-                return null;
-            }
-            // Authentication OK: inform client and return authenticated user.
-            out.println(ClientServerProtocol.buildLoginOk(user.role(), user.name()));
-            return user;
-        } catch (SQLException e) {
-            e.printStackTrace();
-            out.println(ClientServerProtocol.buildError("LOGIN_ERROR"));
-            return null;
-        }
-    }
-
-    /**
-     * Split incoming line into parts. For REGISTER_STUDENT and REGISTER_TEACHER payloads,
-     * fields are split by '|' (to allow spaces inside fields). For other commands, split by whitespace.
-     *
-     * Returned array: parts[0] = command (upper-case), subsequent indices = fields.
-     */
-    private String[] splitCommandLine(String line) {
-        if (line == null) return new String[0];
-        String trimmed = line.trim();
-        if (trimmed.isEmpty()) return new String[0];
-
-        int spaceIdx = trimmed.indexOf(' ');
-        String cmd = (spaceIdx == -1) ? trimmed.toUpperCase() : trimmed.substring(0, spaceIdx).toUpperCase();
-
-        if ("REGISTER_STUDENT".equalsIgnoreCase(cmd) || "REGISTER_TEACHER".equalsIgnoreCase(cmd)) {
-            if (spaceIdx == -1) {
-                // command without payload
-                return new String[]{cmd};
-            }
-            String payload = trimmed.substring(spaceIdx + 1);
-            // split preserving empty fields; trim each field
-            String[] fields = payload.split("\\|", -1);
-            String[] parts = new String[fields.length + 1];
-            parts[0] = cmd;
-            for (int i = 0; i < fields.length; i++) {
-                parts[i + 1] = fields[i] == null ? "" : fields[i].trim();
-            }
-            return parts;
-        } else {
-            // Default: split by whitespace. Keep simple tokenization for other commands.
-            // Use limit to preserve trailing message when relevant (e.g., LOGIN responses parsing handled elsewhere)
-            return trimmed.split("\\s+");
-        }
-    }
-
-    private void handleRegisterStudent(String[] parts, PrintWriter out) {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        if (parts.length < 5) {
-            out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
-            return;
-        }
-
-        int number;
-        try {
-            number = Integer.parseInt(parts[1].trim());
-        } catch (NumberFormatException e) {
-            out.println(ClientServerProtocol.buildRegisterFail("INVALID_NUMBER"));
-            return;
-        }
-        String name = parts[2];
-        String email = parts[3];
-        String password = parts[4];
-
-        synchronized (dbLock) {
-            try {
-                DatabaseManager.RegisterResult res = dbManager.registerStudent(number, name, email, password);
-                switch (res) {
-                    case OK -> {
-                        try {
-                            long newVersion = Server.this.bumpDbVersion();
-
-                            if (isPrimary) {
-                                String passwordHash = PassUtil.hashPassword(password);
-
-                                String sqlForReplication =
-                                        "INSERT INTO users(role, student_number, name, email, password_hash) VALUES ("
-                                                + "'STUDENT',"
-                                                + number
-                                                + ",'"
-                                                + escapeSqlLiteral(name)
-                                                + "','"
-                                                + escapeSqlLiteral(email)
-                                                + "','"
-                                                + escapeSqlLiteral(passwordHash)
-                                                + "')";
-
-                                sendSqlHeartbeatToSecondaries(sqlForReplication);
-                            }
-
-                            out.println(ClientServerProtocol.buildRegisterOk("Student registered"));
-                        } catch (SQLException e) {
-                            System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after REGISTER_STUDENT: "
-                                    + e.getMessage());
-                            out.println(ClientServerProtocol.buildError("DB_ERROR"));
-                        }
-                    }
-                    case EMAIL_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("EMAIL_IN_USE"));
-                    case NUMBER_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("NUMBER_IN_USE"));
-                    default -> out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
-                }
-            } catch (Exception e) {
-                out.println(ClientServerProtocol.buildError("DB_ERROR"));
-            }
-        }
-    }
-
-    private void handleRegisterTeacher(String[] parts, PrintWriter out) {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        // Example: REGISTER_TEACHER <name>|<email>|<password>|<teacherCode>
-        if (parts.length < 5) {
-            out.println(ClientServerProtocol.buildRegisterFail("Missing fields"));
-            return;
-        }
-
-        String name = parts[1];
-        String email = parts[2];
-        String password = parts[3];
-        String teacherCode = parts[4];
-
-        synchronized (dbLock) {
-            try {
-                DatabaseManager.RegisterResult res = dbManager.registerTeacher(name, email, password, teacherCode);
-                switch (res) {
-                    case OK -> {
-                        try {
-                            long newVersion = Server.this.bumpDbVersion();
-
-                            if (isPrimary) {
-                                String passwordHash = PassUtil.hashPassword(password);
-
-                                String sqlForReplication =
-                                        "INSERT INTO users(role, student_number, name, email, password_hash) VALUES ("
-                                                + "'TEACHER',"
-                                                + "NULL,"
-                                                + "'"
-                                                + escapeSqlLiteral(name)
-                                                + "','"
-                                                + escapeSqlLiteral(email)
-                                                + "','"
-                                                + escapeSqlLiteral(passwordHash)
-                                                + "')";
-
-                                sendSqlHeartbeatToSecondaries(sqlForReplication);
-                            }
-
-                            out.println(ClientServerProtocol.buildRegisterOk("Teacher registered"));
-                        } catch (SQLException e) {
-                            System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after REGISTER_TEACHER: "
-                                    + e.getMessage());
-                            out.println(ClientServerProtocol.buildError("DB_ERROR"));
-                        }
-                    }
-                    case EMAIL_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("EMAIL_IN_USE"));
-                    case NUMBER_IN_USE -> out.println(ClientServerProtocol.buildRegisterFail("NUMBER_IN_USE"));
-                    case DatabaseManager.RegisterResult.INVALID_TEACHER_CODE ->
-                            out.println(ClientServerProtocol.buildRegisterFail("INVALID_TEACHER_CODE"));
-                    default -> out.println(ClientServerProtocol.buildRegisterFail("DB_ERROR"));
-                }
-            } catch (Exception e) {
-                out.println(ClientServerProtocol.buildError("DB_ERROR"));
-            }
-        }
-    }
-
     private void postLoginLoop(User user, BufferedReader in, PrintWriter out) throws IOException {
         String line;
         while ((line = in.readLine()) != null) {
 
-            String[] parts = splitCommandLine(line);
+            String[] parts = ServerUtil.splitCommandLine(line);
             if (parts.length == 0)
                 continue;
 
@@ -681,7 +494,7 @@ public class Server {
 
                 case "EDIT_PROFILE" -> {
                     try {
-                        handleEditProfile(user, in, out);
+                        userService.handleEditProfile(user, in, out);
                     } catch (Exception e) {
                         e.printStackTrace();
                         out.println(ClientServerProtocol.buildError("EDIT_PROFILE_ERROR"));
@@ -691,7 +504,7 @@ public class Server {
                 //teacher stuff
                 case "CREATE_QUESTION" -> {
                     try {
-                        handleCreateQuestion(user, in, out);
+                        teacherService.handleCreateQuestion(user, in, out);
                     } catch (Exception e) {
                         e.printStackTrace();
                         out.println(ClientServerProtocol.buildError("CREATE_QUESTION_ERROR"));
@@ -703,7 +516,7 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("ONLY_TEACHERS_CAN_LIST_QUESTIONS"));
                     } else {
                         try {
-                            handleListMyQuestions(user, parts, out);
+                            teacherService.handleListMyQuestions(user, parts, out);
                         } catch (Exception e) {
                             e.printStackTrace();
                             out.println(ClientServerProtocol.buildError("LIST_MY_QUESTIONS_ERROR"));
@@ -716,7 +529,7 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
                     } else {
                         try {
-                            handleEditQuestion(user, in, out);
+                            teacherService.handleEditQuestion(user, in, out);
                         } catch (Exception e) {
                             e.printStackTrace();
                             out.println(ClientServerProtocol.buildError("EDIT_QUESTION_ERROR"));
@@ -729,7 +542,7 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
                     } else {
                         try {
-                            handleDeleteQuestion(user, in, out);
+                            teacherService.handleDeleteQuestion(user, in, out);
                         } catch (Exception e) {
                             e.printStackTrace();
                             out.println(ClientServerProtocol.buildError("DELETE_QUESTION_ERROR"));
@@ -739,7 +552,7 @@ public class Server {
 
                 case "VIEW_RESULTS" -> {
                     try {
-                        handleViewResults(user, in, out);
+                        teacherService.handleViewResults(user, in, out);
                     } catch (Exception e) {
                         e.printStackTrace();
                         out.println(ClientServerProtocol.buildError("VIEW_RESULTS_ERROR"));
@@ -748,7 +561,7 @@ public class Server {
 
                 case "EXPORT_RESULTS" -> {
                     try {
-                        handleExportResults(user, in, out);
+                        teacherService.handleExportResults(user, in, out);
                     } catch (Exception e) {
                         e.printStackTrace();
                         out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_ERROR"));
@@ -757,7 +570,7 @@ public class Server {
 
                 case "EXPORT_ALL_RESULTS" -> {
                     try {
-                        handleExportAllResults(user, out);
+                        teacherService.handleExportAllResults(user, out);
                     } catch (Exception e) {
                         e.printStackTrace();
                         out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_ERROR"));
@@ -772,7 +585,7 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_ANSWER"));
                     } else {
                         try {
-                            handleAnswerQuestion(user, in, out);
+                            studentService.handleAnswerQuestion(user, in, out);
                         } catch (Exception e) {
                             e.printStackTrace();
                             out.println(ClientServerProtocol.buildError("ANSWER_QUESTION_ERROR"));
@@ -785,7 +598,7 @@ public class Server {
                         out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_LIST_ANSWERS"));
                     } else {
                         try {
-                            handleListMyAnswers(user, out);
+                            studentService.handleListMyAnswers(user, out);
                         } catch (Exception e) {
                             e.printStackTrace();
                             out.println(ClientServerProtocol.buildError("LIST_MY_ANSWERS_ERROR"));
@@ -797,1059 +610,15 @@ public class Server {
         }
     }
 
-    private void handleEditProfile(User user, BufferedReader in, PrintWriter out) throws IOException {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        // Ask for new values; blank = keep current
-        out.println("PROMPT New name (leave blank to keep current: " + user.name() + "):");
-        String newName = in.readLine();
-        if (newName == null) {
-            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
-            return;
-        }
-        newName = newName.trim();
-
-        out.println("PROMPT New email (leave blank to keep current):");
-        String newEmail = in.readLine();
-        if (newEmail == null) {
-            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
-            return;
-        }
-        newEmail = newEmail.trim();
-
-        out.println("PROMPT New password (leave blank to keep current):");
-        String newPassword = in.readLine();
-        if (newPassword == null) {
-            out.println(ClientServerProtocol.buildError("EDIT_PROFILE_CANCELLED"));
-            return;
-        }
-        newPassword = newPassword.trim();
-
-        // avoid '|' which breaks our protocol
-        if ((newName != null && newName.contains("|"))
-                || (newEmail != null && newEmail.contains("|"))
-                || (newPassword != null && newPassword.contains("|"))) {
-            out.println(ClientServerProtocol.buildError("Fields cannot contain the '|' character"));
-            return;
-        }
-
-        synchronized (dbLock) {
-            Connection conn = null;
-            String finalName = null;
-            String finalEmail = null;
-            String finalHash = null;
-
-            try {
-                conn = dbManager.getConnection();
-
-                // 1) load current values
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT name, email, password_hash FROM users WHERE id = ?")) {
-                    ps.setLong(1, user.id());
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (!rs.next()) {
-                            out.println(ClientServerProtocol.buildError("USER_NOT_FOUND"));
-                            return;
-                        }
-                        String currentName = rs.getString("name");
-                        String currentEmail = rs.getString("email");
-                        String currentHash = rs.getString("password_hash");
-
-                        finalName = (newName == null || newName.isBlank()) ? currentName : newName;
-                        finalEmail = (newEmail == null || newEmail.isBlank()) ? currentEmail : newEmail;
-                        finalHash = (newPassword == null || newPassword.isBlank())
-                                ? currentHash
-                                : PassUtil.hashPassword(newPassword);
-                    }
-                }
-
-                // 2) apply update (only name, email, password_hash)
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ?")) {
-                    ps.setString(1, finalName);
-                    ps.setString(2, finalEmail);
-                    ps.setString(3, finalHash);
-                    ps.setLong(4, user.id());
-                    ps.executeUpdate();
-                }
-
-                // 3) bump version and replicate UPDATE to secondaries
-                try {
-                    long newVersion = bumpDbVersion();
-                    if (isPrimary) {
-                        String sql = "UPDATE users SET "
-                                + "name='" + escapeSqlLiteral(finalName) + "', "
-                                + "email='" + escapeSqlLiteral(finalEmail) + "', "
-                                + "password_hash='" + escapeSqlLiteral(finalHash) + "' "
-                                + "WHERE id=" + user.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-                } catch (SQLException e) {
-                    e.printStackTrace();
-                    out.println(ClientServerProtocol.buildError("EDIT_PROFILE_VERSION_ERROR"));
-                    return;
-                }
-
-                out.println("BLOCK Profile updated successfully.");
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-                String msg = e.getMessage();
-                if (msg != null && (msg.contains("email") || msg.contains("users.email"))) {
-                    out.println(ClientServerProtocol.buildError("EMAIL_IN_USE"));
-                } else {
-                    out.println(ClientServerProtocol.buildError("EDIT_PROFILE_DB_ERROR"));
-                }
-            }
-        }
-    }
-
-    private String generateAccessCode() {
-        //TODO make sure theres no equal accesCodes in DB just in case
-        String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        java.util.Random rnd = new java.util.Random();
-        StringBuilder sb = new StringBuilder(6);
-        for (int i = 0; i < 6; i++) {
-            sb.append(chars.charAt(rnd.nextInt(chars.length())));
-        }
-        return sb.toString();
-    }
-
-    private void handleListMyAnswers(User user, PrintWriter out) throws SQLException {
-        synchronized (dbLock) {
-            java.util.List<DatabaseManager.StudentAnswerDTO> answers =
-                    dbManager.findClosedAnswersForStudent(user.id());
-
-            StringBuilder sb = new StringBuilder();
-            if (answers.isEmpty()) {
-                sb.append("== You have no answered questions whose answering time has expired ==\n");
-            } else {
-                sb.append("== Your answered questions (closed) ==\n");
-                int idx = 1;
-                for (DatabaseManager.StudentAnswerDTO a : answers) {
-                    // compute state string just for info
-                    java.time.LocalDateTime start = java.time.LocalDateTime.parse(a.startTime());
-                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(a.endTime());
-
-                    sb.append(idx++).append(") [Q").append(a.questionId()).append("] ")
-                            .append(a.statement()).append("\n")
-                            .append("   Start: ").append(start).append(" | End: ").append(end).append("\n")
-                            .append("   Your answer: ").append(a.optionCode())
-                            .append(" -> ").append(a.correct() ? "CORRECT" : "WRONG")
-                            .append("\n\n");
-                }
-            }
-
-            String payload = sb.toString().replace("\r", "").replace("\n", "\\n");
-            out.println("BLOCK " + payload);
-        }
-    }
-
-    private void handleListMyQuestions(User user, String[] parts, PrintWriter out) throws SQLException {
-        String filter = "ALL";
-        if (parts.length >= 2) {
-            filter = parts[1].toUpperCase(); // SCHEDULED | ONGOING | CLOSED | ALL
-        }
-
-        java.time.LocalDateTime now = java.time.LocalDateTime.now();
-
-        synchronized (dbLock) {
-            java.util.List<DatabaseManager.QuestionDTO> questions =
-                    dbManager.findQuestionsByTeacher(user.id());
-
-            StringBuilder sb = new StringBuilder();
-            if (questions.isEmpty()) {
-                sb.append("== You have not created any questions yet ==\n");
-            } else {
-                sb.append("== Your questions ==\n");
-                int idx = 1;
-                for (DatabaseManager.QuestionDTO q : questions) {
-                    java.time.LocalDateTime start = java.time.LocalDateTime.parse(q.startTime());
-                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
-
-                    String state;
-                    if (now.isBefore(start)) {
-                        state = "SCHEDULED";
-                    } else if (now.isAfter(end)) {
-                        state = "CLOSED";
-                    } else {
-                        state = "ONGOING";
-                    }
-
-                    // apply filter
-                    if (!"ALL".equals(filter) && !state.equalsIgnoreCase(filter)) {
-                        continue;
-                    }
-
-                    sb.append(idx++).append(") [Q").append(q.id()).append("] ")
-                            .append(q.statement()).append("\n")
-                            .append("   State: ").append(state)
-                            .append(" | Start: ").append(start)
-                            .append(" | End: ").append(end).append("\n")
-                            .append("   Access code: ").append(q.accessCode())
-                            .append("\n\n");
-                }
-
-                if (sb.toString().endsWith("== Your questions ==\n")) {
-                    sb.append("No questions match the given filter.\n");
-                }
-            }
-
-            String payload = sb.toString().replace("\r", "").replace("\n", "\\n");
-            out.println("BLOCK " + payload);
-        }
-    }
-
-    private void handleCreateQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        // Only teachers can create questions
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        // 1) Ask for statement
-        out.println("Enter question statement:");
-        String statement = in.readLine();
-        if (statement == null || statement.isBlank()) {
-            out.println(ClientServerProtocol.buildError("EMPTY_STATEMENT"));
-            return;
-        }
-
-        // 2) Ask start/end time as simple strings for now
-        out.println("Enter start time (e.g., 2025-01-01T10:00):");
-        String startTime = in.readLine();
-        out.println("Enter end time (e.g., 2025-01-01T10:10):");
-        String endTime = in.readLine();
-
-        // 3) Ask number of options
-        int numOptions = 0;
-        while (true) {
-            out.println("Enter number of options (>= 2):");
-            String line = in.readLine();
-            if (line == null) {
-                out.println(ClientServerProtocol.buildError("ABORTED"));
-                return;
-            }
-            try {
-                numOptions = Integer.parseInt(line.trim());
-                if (numOptions >= 2)
-                    break;
-                out.println("Must be >= 2.");
-            } catch (NumberFormatException e) {
-                out.println("Invalid number, try again.");
-            }
-        }
-
-        // 4) Gather options
-        String[] codes = new String[numOptions];
-        String[] texts = new String[numOptions];
-        boolean[] correctFlags = new boolean[numOptions];
-        boolean isCorrect = false;
-
-        for (int i = 0; i < numOptions; i++) {
-            out.println("Option " + (i + 1) + " - code (e.g., A, B, C):");
-            codes[i] = in.readLine();
-
-            out.println("Option " + (i + 1) + " - text:");
-            texts[i] = in.readLine();
-
-            if(isCorrect == false){
-                out.println("Is this the correct option? (yes/no):");
-                String ans = in.readLine();
-                correctFlags[i] = ans != null && ans.trim().equalsIgnoreCase("yes");
-                isCorrect = true;
-            }
-        }
-
-        // Ensure at least one correct option
-        boolean anyCorrect = false;
-        for (boolean b : correctFlags) {
-            if (b) { anyCorrect = true; break; }
-        }
-        if (!anyCorrect) {
-            out.println(ClientServerProtocol.buildError("NO_CORRECT_OPTION"));
-            return;
-        }
-
-        // 5) Generate access code
-        String accessCode = generateAccessCode();
-
-        // 6) Store in DB with a transaction
-        synchronized (dbLock) {
-            Connection conn = dbManager.getConnection();
-            boolean oldAutoCommit = conn.getAutoCommit();
-            conn.setAutoCommit(false);
-            try {
-                long qId = dbManager.insertQuestion(
-                        user.id(),       // teacherId
-                        statement,
-                        startTime,
-                        endTime,
-                        accessCode
-                );
-
-                for (int i = 0; i < numOptions; i++) {
-                    dbManager.insertOption(qId, codes[i], texts[i], correctFlags[i]);
-                }
-
-                conn.commit();
-
-                try {
-                    if (isPrimary) {
-                        // 1) replicate question INSERT (with explicit id)
-                        {
-                            long newVersion = Server.this.bumpDbVersion();
-
-                            String sqlQuestion =
-                                    "INSERT INTO questions(id, teacherId, statement, startTime, endTime, accessCode) VALUES ("
-                                            + qId + ","
-                                            + user.id()
-                                            + ",'"
-                                            + escapeSqlLiteral(statement)
-                                            + "','"
-                                            + escapeSqlLiteral(startTime)
-                                            + "','"
-                                            + escapeSqlLiteral(endTime)
-                                            + "','"
-                                            + escapeSqlLiteral(accessCode)
-                                            + "')";
-
-                            sendSqlHeartbeatToSecondaries(sqlQuestion);
-                        }
-
-                        // 2) replicate each option INSERT
-                        for (int i = 0; i < numOptions; i++) {
-                            long newVersion = Server.this.bumpDbVersion();
-
-                            String sqlOption =
-                                    "INSERT INTO options(questionId, code, text, isCorrect) VALUES ("
-                                            + qId
-                                            + ",'"
-                                            + escapeSqlLiteral(codes[i])
-                                            + "','"
-                                            + escapeSqlLiteral(texts[i])
-                                            + "',"
-                                            + (correctFlags[i] ? 1 : 0)
-                                            + ")";
-
-                            sendSqlHeartbeatToSecondaries(sqlOption);
-                        }
-                    }
-
-                    out.println("CREATE_QUESTION_OK Access code: " + accessCode);
-                    notifyStudents("NEW_QUESTION " + accessCode);
-                } catch (SQLException e) {
-                    System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after CREATE_QUESTION: "
-                            + e.getMessage());
-                    out.println(ClientServerProtocol.buildError("DB_ERROR"));
-                }
-
-            } catch (SQLException e) {
-                conn.rollback();
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("DB_ERROR_CREATING_QUESTION"));
-
-            } finally {
-                conn.setAutoCommit(oldAutoCommit);
-            }
-        }
-    }
-
-    //will show results of a specific question
-    private void handleViewResults(User user, BufferedReader in, PrintWriter out) throws IOException {
-        // 1) Only teachers
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        // 2) Ask for access code
-        out.println("PROMPT Access code of question:");
-        String accessCode = in.readLine();
-        if (accessCode == null || accessCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
-            return;
-        }
-        accessCode = accessCode.trim();
-
-        synchronized (dbLock) {
-            try {
-                // 3) Load question by access code
-                DatabaseManager.QuestionDTO q = dbManager.findQuestionByAccessCode(accessCode);
-                if (q == null) {
-                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                    return;
-                }
-
-                // 4) Ensure this teacher owns the question
-                if (q.teacherId() != user.id()) {
-                    out.println(ClientServerProtocol.buildError("NOT_YOUR_QUESTION"));
-                    return;
-                }
-
-                // 5) Ensure the question is expired
-                java.time.LocalDateTime now = java.time.LocalDateTime.now();
-                java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
-                if (now.isBefore(end)) {
-                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_EXPIRED"));
-                    return;
-                }
-
-                // 6) Load options and answers
-                java.util.List<DatabaseManager.OptionDTO> opts =
-                        dbManager.findOptionsForQuestion(q.id());
-
-                java.util.List<DatabaseManager.AnswerResultRow> answers =
-                        dbManager.findAnswersForQuestion(q.id());
-
-                // 7) Build the report text
-                StringBuilder sb = new StringBuilder();
-
-                sb.append("Results for question ").append(q.accessCode()).append("\n");
-                sb.append("Statement: ").append(q.statement()).append("\n");
-                sb.append("Start: ").append(q.startTime()).append("\n");
-                sb.append("End: ").append(q.endTime()).append("\n");
-                sb.append("\nOptions:\n");
-
-                for (DatabaseManager.OptionDTO o : opts) {
-                    sb.append("  ").append(o.code()).append(") ").append(o.text());
-                    if (o.isCorrect()) {
-                        sb.append("  [CORRECT]");
-                    }
-                    sb.append("\n");
-                }
-
-                sb.append("\nSubmitted answers:\n");
-                if (answers.isEmpty()) {
-                    sb.append("  (no answers submitted)\n");
-                } else {
-                    for (DatabaseManager.AnswerResultRow row : answers) {
-                        sb.append("  [").append(row.timestamp()).append("] ");
-
-                        if (row.studentNumber() != null) {
-                            sb.append("#").append(row.studentNumber()).append(" ");
-                        }
-
-                        sb.append(row.studentName())
-                                .append(" <").append(row.studentEmail()).append(">")
-                                .append(" -> ").append(row.optionCode());
-
-                        if (row.correct()) {
-                            sb.append(" (CORRECT)");
-                        } else {
-                            sb.append(" (WRONG)");
-                        }
-                        sb.append("\n");
-                    }
-                }
-
-                // 8) Encode as RESULT_BLOCK
-                String payload = sb.toString()
-                        .replace("\r", "")
-                        .replace("\n", "\\n");
-
-                out.println("RESULT_BLOCK " + payload);
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("VIEW_RESULTS_DB_ERROR"));
-            }
-        }
-    }
-
-    private void handleEditQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        // 1) Ask question by access code
-        out.println("PROMPT Access code of question to edit:");
-        String accessCode = in.readLine();
-        if (accessCode == null || accessCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
-            return;
-        }
-        accessCode = accessCode.trim();
-
-        DatabaseManager.QuestionDTO q;
-        int answersCount;
-
-        synchronized (dbLock) {
-            q = dbManager.findQuestionByAccessCode(accessCode);
-            if (q == null) {
-                out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                return;
-            }
-            if (q.teacherId() != user.id()) {
-                out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
-                return;
-            }
-            answersCount = dbManager.countAnswersForQuestion(q.id());
-        }
-
-        if (answersCount > 0) {
-            out.println(ClientServerProtocol.buildError("QUESTION_HAS_ANSWERS_CANNOT_EDIT"));
-            return;
-        }
-
-        // 2) Ask new statement / times / options (similar to CREATE_QUESTION)
-
-        out.println("Enter NEW question statement:");
-        String statement = in.readLine();
-        if (statement == null || statement.isBlank()) {
-            out.println(ClientServerProtocol.buildError("EMPTY_STATEMENT"));
-            return;
-        }
-
-        out.println("Enter NEW start time (e.g., 2025-01-01T10:00):");
-        String startTime = in.readLine();
-        out.println("Enter NEW end time (e.g., 2025-01-01T10:10):");
-        String endTime = in.readLine();
-
-        int numOptions = 0;
-        while (true) {
-            out.println("Enter number of options (2..5):");
-            String s = in.readLine();
-            if (s == null) {
-                out.println(ClientServerProtocol.buildError("CANCELLED"));
-                return;
-            }
-            try {
-                numOptions = Integer.parseInt(s.trim());
-                if (numOptions < 2 || numOptions > 5) {
-                    out.println(ClientServerProtocol.buildError("INVALID_NUM_OPTIONS"));
-                } else {
-                    break;
-                }
-            } catch (NumberFormatException e) {
-                out.println(ClientServerProtocol.buildError("INVALID_NUM_OPTIONS"));
-            }
-        }
-
-        String[] codes = new String[numOptions];
-        String[] texts = new String[numOptions];
-        boolean[] correctFlags = new boolean[numOptions];
-
-        boolean hasCorrect = false;
-
-        for (int i = 0; i < numOptions; i++) {
-            String code = String.valueOf((char)('A' + i));
-            out.println("Option " + code + " text:");
-            String txt = in.readLine();
-            if (txt == null || txt.isBlank()) {
-                out.println(ClientServerProtocol.buildError("EMPTY_OPTION_TEXT"));
-                return;
-            }
-
-            out.println("Is this a correct option? (yes/no):");
-            String ans = in.readLine();
-            boolean isCorrect = ans != null && ans.trim().equalsIgnoreCase("yes");
-
-            codes[i] = code;
-            texts[i] = txt;
-            correctFlags[i] = isCorrect;
-            if (isCorrect) hasCorrect = true;
-        }
-
-        if (!hasCorrect) {
-            out.println(ClientServerProtocol.buildError("NO_CORRECT_OPTION"));
-            return;
-        }
-
-        // 3) Apply changes in DB + replicate UPDATE & options changes
-
-        synchronized (dbLock) {
-            Connection conn = dbManager.getConnection();
-            boolean oldAuto = conn.getAutoCommit();
-            conn.setAutoCommit(false);
-            try {
-                // Update question core fields (statement + times)
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE questions SET statement = ?, startTime = ?, endTime = ? WHERE id = ?")) {
-                    ps.setString(1, statement);
-                    ps.setString(2, startTime);
-                    ps.setString(3, endTime);
-                    ps.setLong(4, q.id());
-                    ps.executeUpdate();
-                }
-
-                // Delete old options
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "DELETE FROM options WHERE questionId = ?")) {
-                    ps.setLong(1, q.id());
-                    ps.executeUpdate();
-                }
-
-                // Insert new options
-                for (int i = 0; i < numOptions; i++) {
-                    dbManager.insertOption(q.id(), codes[i], texts[i], correctFlags[i]);
-                }
-
-                conn.commit();
-
-                // Replication: UPDATE question, then delete+reinsert options
-                if (isPrimary) {
-                    {
-                        long newVersion = bumpDbVersion();
-                        String sql = "UPDATE questions SET "
-                                + "statement='" + escapeSqlLiteral(statement) + "', "
-                                + "startTime='" + escapeSqlLiteral(startTime) + "', "
-                                + "endTime='" + escapeSqlLiteral(endTime) + "' "
-                                + "WHERE id=" + q.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-
-                    {
-                        long newVersion = bumpDbVersion();
-                        String sql = "DELETE FROM options WHERE questionId=" + q.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-
-                    for (int i = 0; i < numOptions; i++) {
-                        long newVersion = bumpDbVersion();
-                        String sql = "INSERT INTO options(questionId, code, text, isCorrect) VALUES ("
-                                + q.id() + ","
-                                + "'" + escapeSqlLiteral(codes[i]) + "',"
-                                + "'" + escapeSqlLiteral(texts[i]) + "',"
-                                + (correctFlags[i] ? 1 : 0)
-                                + ")";
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-                }
-
-                out.println("BLOCK Question edited successfully. Access code: " + accessCode);
-
-            } catch (SQLException e) {
-                conn.rollback();
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("EDIT_QUESTION_DB_ERROR"));
-            } finally {
-                conn.setAutoCommit(oldAuto);
-            }
-        }
-    }
-
-    private void handleDeleteQuestion(User user, BufferedReader in, PrintWriter out) throws IOException, SQLException {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        out.println("PROMPT Access code of question to delete:");
-        String accessCode = in.readLine();
-        if (accessCode == null || accessCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
-            return;
-        }
-        accessCode = accessCode.trim();
-
-        DatabaseManager.QuestionDTO q;
-        int answersCount;
-
-        synchronized (dbLock) {
-            q = dbManager.findQuestionByAccessCode(accessCode);
-            if (q == null) {
-                out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                return;
-            }
-            if (q.teacherId() != user.id()) {
-                out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
-                return;
-            }
-            answersCount = dbManager.countAnswersForQuestion(q.id());
-        }
-
-        if (answersCount > 0) {
-            out.println(ClientServerProtocol.buildError("QUESTION_HAS_ANSWERS_CANNOT_DELETE"));
-            return;
-        }
-
-        synchronized (dbLock) {
-            Connection conn = dbManager.getConnection();
-            boolean oldAuto = conn.getAutoCommit();
-            conn.setAutoCommit(false);
-            try {
-                // Since we checked there are no answers, this is mostly defensive
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "DELETE FROM answers WHERE questionId = ?")) {
-                    ps.setLong(1, q.id());
-                    ps.executeUpdate();
-                }
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "DELETE FROM options WHERE questionId = ?")) {
-                    ps.setLong(1, q.id());
-                    ps.executeUpdate();
-                }
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "DELETE FROM questions WHERE id = ?")) {
-                    ps.setLong(1, q.id());
-                    ps.executeUpdate();
-                }
-
-                conn.commit();
-
-                if (isPrimary) {
-                    {
-                        long newVersion = bumpDbVersion();
-                        String sql = "DELETE FROM answers WHERE questionId=" + q.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-                    {
-                        long newVersion = bumpDbVersion();
-                        String sql = "DELETE FROM options WHERE questionId=" + q.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-                    {
-                        long newVersion = bumpDbVersion();
-                        String sql = "DELETE FROM questions WHERE id=" + q.id();
-                        sendSqlHeartbeatToSecondaries(sql);
-                    }
-                }
-
-                out.println("BLOCK Question deleted successfully. Access code: " + accessCode);
-
-            } catch (SQLException e) {
-                conn.rollback();
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("DELETE_QUESTION_DB_ERROR"));
-            } finally {
-                conn.setAutoCommit(oldAuto);
-            }
-        }
-    }
-
-    private void handleExportResults(User user, BufferedReader in, PrintWriter out) throws IOException {
-        // only teachers
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        // ask access code
-        out.println("PROMPT Access code of question to export:");
-        String accessCode = in.readLine();
-        if (accessCode == null || accessCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
-            return;
-        }
-        accessCode = accessCode.trim();
-
-        DatabaseManager.QuestionDTO q;
-        java.util.List<DatabaseManager.OptionDTO> opts;
-        java.util.List<DatabaseManager.AnswerResultRow> answers;
-
-        // read from DB under lock
-        synchronized (dbLock) {
-            try {
-                q = dbManager.findQuestionByAccessCode(accessCode);
-                if (q == null) {
-                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                    return;
-                }
-
-                // must belong to this teacher
-                if (q.teacherId() != user.id()) {
-                    out.println(ClientServerProtocol.buildError("NOT_OWNER_OF_QUESTION"));
-                    return;
-                }
-
-                // only closed questions can be exported
-                java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
-                java.time.LocalDateTime now = java.time.LocalDateTime.now();
-                if (!now.isAfter(end)) {
-                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_CLOSED"));
-                    return;
-                }
-
-                opts = dbManager.findOptionsForQuestion(q.id());
-                answers = dbManager.findAnswersForQuestion(q.id());
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_DB_ERROR"));
-                return;
-            }
-        }
-
-        File exportDir = getGlobalExportsDir();
-
-        String safeCode = accessCode.replaceAll("[^a-zA-Z0-9_-]", "_");
-        File csvFile = new File(
-                exportDir,
-                "question-" + q.id() + "-" + safeCode + "-" + System.currentTimeMillis() + ".csv"
-        );
-
-        try (PrintWriter pw = new PrintWriter(csvFile)) {
-            writeQuestionResultsToCsv(pw, q, opts, answers);
-        } catch (IOException e) {
-            e.printStackTrace();
-            out.println(ClientServerProtocol.buildError("EXPORT_RESULTS_IO_ERROR"));
-            return;
-        }
-
-        out.println("EXPORT_OK " + csvFile.getAbsolutePath());
-    }
-
-    private void handleExportAllResults(User user, PrintWriter out) {
-        if (!"TEACHER".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("NOT_A_TEACHER"));
-            return;
-        }
-
-        java.time.LocalDateTime now = java.time.LocalDateTime.now();
-        java.util.List<QuestionExportData> toExport = new java.util.ArrayList<>();
-
-        // load all closed questions + their data under lock
-        synchronized (dbLock) {
-            try {
-                java.util.List<DatabaseManager.QuestionDTO> questions =
-                        dbManager.findQuestionsByTeacher(user.id());
-
-                for (DatabaseManager.QuestionDTO q : questions) {
-                    java.time.LocalDateTime end = java.time.LocalDateTime.parse(q.endTime());
-                    if (!now.isAfter(end)) {
-                        // not closed yet
-                        continue;
-                    }
-
-                    java.util.List<DatabaseManager.OptionDTO> opts =
-                            dbManager.findOptionsForQuestion(q.id());
-                    java.util.List<DatabaseManager.AnswerResultRow> answers =
-                            dbManager.findAnswersForQuestion(q.id());
-
-                    toExport.add(new QuestionExportData(q, opts, answers));
-                }
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_DB_ERROR"));
-                return;
-            }
-        }
-
-        if (toExport.isEmpty()) {
-            out.println(ClientServerProtocol.buildError("NO_CLOSED_QUESTIONS_TO_EXPORT"));
-            return;
-        }
-
-        File exportDir = getGlobalExportsDir();
-
-        File csvFile = new File(
-                exportDir,
-                "all-questions-teacher-" + user.email() + "-" + System.currentTimeMillis() + ".csv"
-        );
-
-        try (PrintWriter pw = new PrintWriter(csvFile)) {
-            boolean first = true;
-            for (QuestionExportData qd : toExport) {
-                if (!first) {
-                    pw.println();
-                    pw.println();
-                }
-                first = false;
-
-                writeQuestionResultsToCsv(
-                        pw,
-                        qd.question(),
-                        qd.options(),
-                        qd.answers()
-                );
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-            out.println(ClientServerProtocol.buildError("EXPORT_ALL_RESULTS_IO_ERROR"));
-            return;
-        }
-
-        out.println("EXPORT_OK " + csvFile.getAbsolutePath());
-    }
-
-    private void handleAnswerQuestion(User user, BufferedReader in, PrintWriter out) throws IOException {
-        if (!isPrimary) {
-            out.println(ClientServerProtocol.buildError("Primary server is down, please retry in a few seconds"));
-            return;
-        }
-
-        if (!"STUDENT".equalsIgnoreCase(user.role())) {
-            out.println(ClientServerProtocol.buildError("ONLY_STUDENTS_CAN_ANSWER"));
-            return;
-        }
-
-        out.println("PROMPT Access code:");
-        String accessCode = in.readLine();
-        if (accessCode == null || accessCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_ACCESS_CODE"));
-            return;
-        }
-        accessCode = accessCode.trim();
-
-        // Variáveis locais para ler do DB dentro do lock e depois liberar
-        long questionId;
-        String statement;
-        java.time.LocalDateTime start;
-        java.time.LocalDateTime end;
-        java.util.List<String[]> options = new java.util.ArrayList<>(); // [code, text]
-
-        // Ler tudo do BD dentro do lock
-        synchronized (dbLock) {
-            try {
-                Connection conn = dbManager.getConnection();
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT id, statement, startTime, endTime FROM questions WHERE accessCode = ?")) {
-                    ps.setString(1, accessCode);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (!rs.next()) {
-                            out.println(ClientServerProtocol.buildError("QUESTION_NOT_FOUND"));
-                            return;
-                        }
-                        questionId = rs.getLong("id");
-                        statement = rs.getString("statement");
-                        start = java.time.LocalDateTime.parse(rs.getString("startTime"));
-                        end = java.time.LocalDateTime.parse(rs.getString("endTime"));
-                    }
-                }
-
-                java.time.LocalDateTime now = java.time.LocalDateTime.now();
-                if (now.isBefore(start) || now.isAfter(end)) {
-                    out.println(ClientServerProtocol.buildError("QUESTION_NOT_ACTIVE"));
-                    return;
-                }
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT COUNT(*) FROM answers WHERE studentId = ? AND questionId = ?")) {
-                    ps.setLong(1, user.id());
-                    ps.setLong(2, questionId);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (rs.next() && rs.getInt(1) > 0) {
-                            out.println(ClientServerProtocol.buildError("ALREADY_ANSWERED"));
-                            return;
-                        }
-                    }
-                }
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT code, text FROM options WHERE questionId = ? ORDER BY code")) {
-                    ps.setLong(1, questionId);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            options.add(new String[]{ rs.getString("code"), rs.getString("text") });
-                        }
-                    }
-                }
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
-                return;
-            }
-        } // fim do synchronized - lock liberado aqui
-
-        // Construir e enviar QUESTION_BLOCK fora do lock
-        StringBuilder sb = new StringBuilder();
-        sb.append("Question: ").append(statement).append("\n");
-        sb.append("Options:").append("\n");
-        for (String[] opt : options) {
-            sb.append(opt[0]).append(") ").append(opt[1]).append("\n");
-        }
-        String questionText = sb.toString().replace("\r", "").replace("\n", "\\n");
-        out.println("QUESTION_BLOCK " + questionText);
-
-        // Ler a resposta do cliente sem segurar o lock
-        String optionCode = in.readLine();
-        if (optionCode == null || optionCode.isBlank()) {
-            out.println(ClientServerProtocol.buildError("MISSING_OPTION_CODE"));
-            out.println("QUESTION_ABORTED");
-            return;
-        }
-        optionCode = optionCode.trim();
-
-        // Reentrar no lock apenas para validar e gravar
-        synchronized (dbLock) {
-            try {
-                Connection conn = dbManager.getConnection();
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT COUNT(*) FROM options WHERE questionId = ? AND code = ?")) {
-                    ps.setLong(1, questionId);
-                    ps.setString(2, optionCode);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (!rs.next() || rs.getInt(1) == 0) {
-                            out.println(ClientServerProtocol.buildError("INVALID_OPTION_CODE"));
-                            out.println("QUESTION_ABORTED");
-                            return;
-                        }
-                    }
-                }
-
-                String timestamp = java.time.LocalDateTime.now().toString();
-
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES (?,?,?,?)")) {
-                    ps.setLong(1, user.id());
-                    ps.setLong(2, questionId);
-                    ps.setString(3, optionCode);
-                    ps.setString(4, timestamp);
-                    ps.executeUpdate();
-                }
-
-                try {
-                    long newVersion = Server.this.bumpDbVersion();
-                    if (isPrimary) {
-                        String sqlForReplication =
-                                "INSERT INTO answers(studentId, questionId, optionCode, timestamp) VALUES ("
-                                        + user.id()
-                                        + ","
-                                        + questionId
-                                        + ",'"
-                                        + escapeSqlLiteral(optionCode)
-                                        + "','"
-                                        + escapeSqlLiteral(timestamp)
-                                        + "')";
-                        sendSqlHeartbeatToSecondaries(sqlForReplication);
-                    }
-                } catch (SQLException e) {
-                    System.err.println("[SERVER] Failed to bump DB version / send SQL heartbeat after ANSWER_QUESTION: "
-                            + e.getMessage());
-                    out.println(ClientServerProtocol.buildError("DB_ERROR"));
-                    return;
-                }
-
-                out.println("ANSWER_OK");
-            } catch (SQLException e) {
-                e.printStackTrace();
-                out.println(ClientServerProtocol.buildError("DB_ERROR_ANSWERING"));
-                out.println("QUESTION_ABORTED");
-            }
-        }
-    }
-
     public synchronized long bumpDbVersion() throws SQLException {
         long newVersion = dbManager.incrementDbVersion();
         this.dbVersion = newVersion;
         System.out.println("[SERVER] DB version bumped to " + newVersion);
         return newVersion;
+    }
+
+    public void notifyStudents(String s) {
+        notificationHub.notifyStudents(s);
     }
 
     // Inner class for handling a client connection
@@ -1877,34 +646,34 @@ public class Server {
                     if (line == null) // cliente fechou socket
                         break;
 
-                    String[] parts = splitCommandLine(line);
+                    String[] parts = ServerUtil.splitCommandLine(line);
                     if (parts.length == 0) continue;
                     String cmd = parts[0].toUpperCase();
 
                     switch (cmd) {
                         //common stuff
                         case "LOGIN" -> {
-                            user = handleLogin(parts, in, out);
+                            user = userService.handleLogin(parts, in, out);
                             if (user != null) {
                                 // register for notifications if this is a student
-                                registerStudentNotification(user, out);
+                                notificationHub.registerStudentNotification(user, out);
                                 try {
                                     postLoginLoop(user, in, out);
                                 } catch (IOException e) {
                                     System.err.println(getName() + " - session IO error: " + e.getMessage());
                                 } finally {
                                     // remove from notification sinks and allow new login on same socket
-                                    unregisterNotification(out);
+                                    notificationHub.unregisterNotification(out);
                                     user = null;
                                 }
                             }
                         }
 
                         //student stuff
-                        case "REGISTER_STUDENT" -> handleRegisterStudent(parts, out);
+                        case "REGISTER_STUDENT" -> userService.handleRegisterStudent(parts, out);
 
                         //teacher stuff
-                        case "REGISTER_TEACHER" -> handleRegisterTeacher(parts, out);
+                        case "REGISTER_TEACHER" -> userService.handleRegisterTeacher(parts, out);
                         default -> out.println(ClientServerProtocol.buildError("NOT_LOGGED_IN_OR_UNKNOWN_CMD"));
                     }
                 }
@@ -1918,100 +687,8 @@ public class Server {
         }
     }
 
-    private static String escapeSqlLiteral(String value) {
-        if (value == null) return "";
-        return value.replace("'", "''");
-    }
-
-    // Helper to encode a value as a CSV field (always quoted)
-    private static String toCsvField(String value) {
-        if (value == null)
-            return "\"\"";
-        String v = value.replace("\"", "\"\""); // escape double-quotes
-        return "\"" + v + "\"";
-    }
-
-    // Small record to hold all info for a question export
-    private record QuestionExportData(
-            DatabaseManager.QuestionDTO question,
-            java.util.List<DatabaseManager.OptionDTO> options,
-            java.util.List<DatabaseManager.AnswerResultRow> answers
-    ) {}
-
-    // Writes ONE question (metadata + options + answers) in CSV format to pw
-    private void writeQuestionResultsToCsv(
-            PrintWriter pw,
-            DatabaseManager.QuestionDTO q,
-            java.util.List<DatabaseManager.OptionDTO> opts,
-            java.util.List<DatabaseManager.AnswerResultRow> answers
-    ) {
-        // Question header
-        pw.println("QuestionID,AccessCode,Statement,StartTime,EndTime");
-        pw.println(
-                toCsvField(String.valueOf(q.id())) + "," +
-                        toCsvField(q.accessCode()) + "," +
-                        toCsvField(q.statement()) + "," +
-                        toCsvField(q.startTime()) + "," +
-                        toCsvField(q.endTime())
-        );
-
-        pw.println();
-        pw.println("OptionCode,OptionText,IsCorrect");
-        for (DatabaseManager.OptionDTO o : opts) {
-            pw.println(
-                    toCsvField(o.code()) + "," +
-                            toCsvField(o.text()) + "," +
-                            toCsvField(o.isCorrect() ? "true" : "false")
-            );
-        }
-
-        pw.println();
-        pw.println("Timestamp,StudentNumber,StudentName,StudentEmail,OptionCode,Correct");
-        for (DatabaseManager.AnswerResultRow row : answers) {
-            String studentNumberStr = (row.studentNumber() != null)
-                    ? String.valueOf(row.studentNumber())
-                    : "";
-            pw.println(
-                    toCsvField(row.timestamp()) + "," +
-                            toCsvField(studentNumberStr) + "," +
-                            toCsvField(row.studentName()) + "," +
-                            toCsvField(row.studentEmail()) + "," +
-                            toCsvField(row.optionCode()) + "," +
-                            toCsvField(row.correct() ? "true" : "false")
-            );
-        }
-    }
-
-    private static File getGlobalExportsDir() {
-        File root = new File(System.getProperty("user.dir")); // project root at runtime
-        File exportsDir = new File(root, "exports");
-        if (!exportsDir.exists()) {
-            exportsDir.mkdirs();
-        }
-        return exportsDir;
-    }
-
-    private void registerStudentNotification(User user, PrintWriter out) {
-        if (user != null && "STUDENT".equalsIgnoreCase(user.role())) {
-            studentNotificationSinks.add(out);
-        }
-    }
-
-    private void unregisterNotification(PrintWriter out) {
-        studentNotificationSinks.remove(out);
-    }
-
-    private void notifyStudents(String payload) {
-        String line = "NOTIFY " + payload;
-        synchronized (studentNotificationSinks) {
-            for (PrintWriter pw : studentNotificationSinks) {
-                try {
-                    pw.println(line);
-                } catch (Exception ignored) {
-                    // broken clients will be cleaned up on close
-                }
-            }
-        }
+    public boolean isPrimary() {
+        return isPrimary;
     }
 
     public static void main(String[] args) throws Exception {

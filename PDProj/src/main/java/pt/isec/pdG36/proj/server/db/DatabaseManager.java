@@ -2,8 +2,6 @@ package pt.isec.pdG36.proj.server.db;
 
 import java.nio.file.Path;
 import java.sql.*;
-import java.util.List;
-import java.util.UUID;
 
 public class DatabaseManager implements AutoCloseable {
     private final Path dbPath;
@@ -29,16 +27,7 @@ public class DatabaseManager implements AutoCloseable {
         return dbPath;
     }
 
-    // Resultado explícito para operações de registo
-    public enum RegisterResult {
-        OK,
-        EMAIL_IN_USE,
-        NUMBER_IN_USE,
-        INVALID_TEACHER_CODE,
-        DB_ERROR
-    }
-
-    // This will only create the tables for the database
+    //creates the tables if they do not exist
     public void initSchema() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
 
@@ -195,10 +184,6 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    public String getDbPath() {
-        return dbPath.toString();
-    }
-
     public User authenticate(String email, String password) throws SQLException {
         String sql = "SELECT id, role, student_number, name, email, password_hash FROM users WHERE email = ?";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -269,41 +254,6 @@ public class DatabaseManager implements AutoCloseable {
 
         }
     }
-
-    public record StudentAnswerDTO(
-            long questionId,
-            String statement,
-            String startTime,
-            String endTime,
-            String optionCode,
-            boolean correct
-    ) {}
-
-    public record QuestionDTO(
-            long id,
-            long teacherId,
-            String statement,
-            String startTime,
-            String endTime,
-            String accessCode
-    ) {}
-
-    public record OptionDTO(
-            long id,
-            long questionId,
-            String code,
-            String text,
-            boolean isCorrect
-    ) {}
-
-    public record AnswerResultRow(
-            String timestamp,
-            Integer studentNumber,
-            String studentName,
-            String studentEmail,
-            String optionCode,
-            boolean correct
-    ) {}
 
     public QuestionDTO findQuestionByAccessCode(String accessCode) throws SQLException {
         String sql = """
@@ -478,24 +428,6 @@ public class DatabaseManager implements AutoCloseable {
 
         return list;
     }
-
-    public void insertAnswer(long studentId, long questionId, String optionCode, String timestamp) throws SQLException {
-        String sql = """
-                INSERT INTO answers(studentId, questionId, optionCode, timestamp)
-                VALUES (?,?,?,?)
-                """;
-
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, studentId);
-            ps.setLong(2, questionId);
-            ps.setString(3, optionCode);
-            ps.setString(4, timestamp); // standardize later maybe
-            ps.executeUpdate();
-
-        }
-    }
-
-    // --- DB VERSIONING ----------------------------------------------------
 
     public long getCurrentDbVersion() throws SQLException {
         String sql = "SELECT version FROM version WHERE id = 1";

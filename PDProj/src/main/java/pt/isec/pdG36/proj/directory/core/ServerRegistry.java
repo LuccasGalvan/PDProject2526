@@ -40,7 +40,6 @@ public class ServerRegistry {
         if (info != null) {
             info.setLastHeartbeat(now);
         }
-        // if null: ignore (not auto-registering)
     }
 
     public synchronized void unregister(InetAddress addr, int clientTcpPort, int dbTcpPort) {

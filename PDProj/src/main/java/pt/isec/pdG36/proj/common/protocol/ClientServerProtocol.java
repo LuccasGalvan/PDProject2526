@@ -30,7 +30,7 @@ public final class ClientServerProtocol {
         return ERROR + " " + (message == null ? "" : message);
     }
 
-    // Now use '|' as delimiter for multi-word fields after the command token.
+    //use '|' as delimiter for multi-word fields after the command token.
     public static String buildRegisterStudentRequest(int number, String name, String email, String password) {
         return REGISTER_STUDENT + " " + number + "|" + name + "|" + email + "|" + password;
     }

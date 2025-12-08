@@ -9,8 +9,6 @@ import java.net.InetAddress;
 import static java.lang.Thread.sleep;
 
 public class ClientMain {
-    static String assignedRole;
-
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
             System.out.println("Usage: java client.ClientMain <dirIP> <dirUdpPort>");
@@ -49,10 +47,8 @@ public class ClientMain {
                 case "1" -> {
                     String role = doLogin(conn, keyboard);
                     if (role != null) {
-                        // sessão autenticada nesta ligação
                         postLoginLoop(conn, keyboard, role);
                     }
-                    // depois da sessão (ou tentativa), fecha esta ligação
                     conn.close();
                 }
                 case "2" -> {
@@ -88,7 +84,6 @@ public class ClientMain {
         String respLine;
         try {
             respLine = conn.safeReadLine();
-            System.out.println("[CLIENT] Raw login response: " + respLine); // DEBUG
         } catch (Exception e) {
             System.err.println("[CLIENT] Error reading login response: " + e.getMessage());
             return null;
@@ -110,6 +105,7 @@ public class ClientMain {
 
     }
 
+    // helper to check for '|' in any of the given strings (because we use it as field separator)
     private static boolean containsPipe(String... vals) {
         for (String v : vals) if (v != null && v.contains("|")) return true;
         return false;
@@ -202,7 +198,6 @@ public class ClientMain {
 
         String line;
         while (true) {
-            // print role-specific menu
             System.out.println();
             System.out.println("=== Menu (" + (isTeacher ? "Teacher" : "Student") + ") ===");
             if (isTeacher) {
@@ -232,7 +227,6 @@ public class ClientMain {
             line = line.trim();
             if (line.isEmpty()) continue;
 
-            // map numeric choices to actual commands
             String toSend = line;
             if (isTeacher) {
                 switch (line) {
@@ -263,7 +257,6 @@ public class ClientMain {
                 }
             }
 
-            // send the command typed by the user (or mapped numeric)
             conn.sendLine(toSend);
 
             try {
@@ -275,7 +268,6 @@ public class ClientMain {
 
                 String trimmed = serverResp.trim();
 
-                // 1) question block special handling
                 if (trimmed.startsWith("QUESTION_BLOCK ")) {
                     handleQuestionBlock(serverResp, conn, keyboard);
                     continue;
@@ -286,7 +278,6 @@ public class ClientMain {
                     continue;
                 }
 
-                // 1.5) generic BLOCK (multi-line info, no extra input)
                 if (trimmed.startsWith("BLOCK ")) {
                     String payload = trimmed.substring("BLOCK ".length());
                     payload = payload.replace("\\n", "\n");
@@ -300,7 +291,6 @@ public class ClientMain {
                     continue;
                 }
 
-                // 2) generic prompts (including "PROMPT Access code:")
                 System.out.println("SERVER: " + serverResp);
                 if (trimmed.startsWith("PROMPT ") || trimmed.endsWith(":")) {
                     while (true) {
@@ -316,15 +306,14 @@ public class ClientMain {
 
                         String t = resp.trim();
 
-                        // if the server now sends a question block, handle it specially
                         if (t.startsWith("QUESTION_BLOCK ")) {
                             handleQuestionBlock(resp, conn, keyboard);
-                            break; // done with this prompt flow
+                            break;
                         }
 
                         if (t.startsWith("RESULT_BLOCK ")) {
                             handleResultBlock(resp);
-                            break; // done with this prompt flow
+                            break;
                         }
 
                         System.out.println("SERVER: " + resp);
@@ -358,6 +347,9 @@ public class ClientMain {
         }
     }
 
+
+    //there is a problem with this code block that we cant assure the user inputs a valid option code
+    //dont know how to fix it right tho big sad
     private static void handleQuestionBlock(String serverResp,
                                             ClientConnection conn,
                                             BufferedReader keyboard) throws Exception {

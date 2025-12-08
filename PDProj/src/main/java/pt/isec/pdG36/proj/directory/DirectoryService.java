@@ -54,7 +54,7 @@ public class DirectoryService {
             case "UNREGISTER" -> onUnregister(parts, srcAddr);
             case "GET_SERVER" -> onGetServer(srcAddr, srcPort);
             default -> {
-                // ignore invalid
+                //ignore
             }
         }
     }
@@ -94,7 +94,7 @@ public class DirectoryService {
                 System.currentTimeMillis()
         );
 
-        // update primary if needed
+        //update primary if needed
         ServerInfo primary = registry.getPrimary();
         if (primary != null) {
             String resp = DirectoryProtocol.buildPrimaryReply(

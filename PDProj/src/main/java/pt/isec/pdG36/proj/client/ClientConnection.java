@@ -26,8 +26,6 @@ public class ClientConnection {
         this.dirUdpPort = dirUdpPort;
     }
 
-    //public API
-
     public boolean connectToPrimary() {
         for (int attempt = 1; attempt <= 10; attempt++) {
             DirectoryProtocol.ServerInfoResp ep = requestPrimaryFromDirectory();
@@ -48,20 +46,10 @@ public class ClientConnection {
         return false;
     }
 
-    public boolean reconnectToPrimary() {
-        closeSilently();
-        return connectToPrimary();
-    }
-
     public void sendLine(String line) {
         if (out != null) {
             out.println(line);
         }
-    }
-
-    public String readLine() throws IOException {
-        if (in == null) return null;
-        return in.readLine();
     }
 
     public void close() {
@@ -69,7 +57,6 @@ public class ClientConnection {
     }
 
     //helpers
-
     private DirectoryProtocol.ServerInfoResp requestPrimaryFromDirectory() {
         try (DatagramSocket udp = new DatagramSocket()) {
             udp.setSoTimeout(2000);
@@ -194,6 +181,4 @@ public class ClientConnection {
             return null;
         }
     }
-
-    private record ServerEndpoint(String host, int port) {}
 }
